@@ -86,7 +86,7 @@ struct rr_data_a {
 };
 
 struct rr_data_aaaa {
-  struct in6_addr *addr;
+  struct in6_addr addr;
 };
 
 struct rr_entry {
@@ -215,7 +215,7 @@ typedef void (*mdnsd_packet_callback)(struct mdns_pkt *pkt, void *userdata);
 // returns NULL if unsuccessful
 struct mdnsd *mdnsd_start();
 
-int mdnsd_set_ipv4_interface(struct mdnsd *s, uint32_t interface_addr);
+int mdnsd_add_ipv4_interface(struct mdnsd *s, uint32_t interface_addr);
 
 // stops the given MDNS responder instance
 void mdnsd_stop(struct mdnsd *s);

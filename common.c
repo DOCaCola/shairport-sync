@@ -393,7 +393,7 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
   int ret = 0; // no error
   int local_socket = socket(ip_family, type, 0);
   if (local_socket == -1)
-    ret = errno;
+    ret = socket_set_errno();
   if (ret == 0) {
     SOCKADDR myaddr;
     memset(&myaddr, 0, sizeof(myaddr));
@@ -415,7 +415,7 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
     }
 #endif
     if (ret < 0) {
-      ret = errno;
+      ret = socket_set_errno();
       safe_socket_close(&local_socket);
       char errorstring[1024];
       getErrorText((char *)errorstring, sizeof(errorstring));
@@ -426,7 +426,7 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
       socklen_t local_len = sizeof(local);
       ret = getsockname(local_socket, (struct sockaddr *)&local, &local_len);
       if (ret < 0) {
-        ret = errno;
+        ret = socket_set_errno();
         safe_socket_close(&local_socket);
         char errorstring[1024];
         getErrorText((char *)errorstring, sizeof(errorstring));
@@ -455,8 +455,10 @@ uint16_t bind_UDP_port(int ip_family, const char *self_ip_address, uint32_t scop
   int ret = 0;
 
   int local_socket = socket(ip_family, SOCK_DGRAM, IPPROTO_UDP);
-  if (local_socket == -1)
+  if (local_socket == -1) {
+    socket_set_errno();
     die("Could not allocate a socket.");
+  }
 
   /*
     int val = 1;
@@ -492,6 +494,9 @@ uint16_t bind_UDP_port(int ip_family, const char *self_ip_address, uint32_t scop
       ret = bind(local_socket, (struct sockaddr *)sa6, sizeof(struct sockaddr_in6));
     }
 #endif
+
+    if (ret < 0)
+      socket_set_errno();
 
   } while ((ret < 0) && (errno == EADDRINUSE) && (desired_port != 0) &&
            (tryCount < config.udp_port_range));

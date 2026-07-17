@@ -1231,22 +1231,17 @@ void rtp_request_resend(seq_t first, uint32_t count, rtsp_conn_info *conn) {
           (drand48() > config.diagnostic_drop_packet_fraction)) {
         // put a time limit on the sendto
 
-        struct timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
         int response;
 #ifdef CONFIG_AIRPLAY_2
         if (conn->airplay_type == ap_2) {
-          if (setsockopt(conn->ap2_control_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
-                         sizeof(timeout)) < 0)
+          if (socket_set_timeout_ms(conn->ap2_control_socket, SO_SNDTIMEO, 100) < 0)
             debug(1, "Can't set timeout on resend request socket.");
           response = sendto(conn->ap2_control_socket, req, sizeof(req), 0,
                             (struct sockaddr *)&conn->ap2_remote_control_socket_addr,
                             conn->ap2_remote_control_socket_addr_length);
         } else {
 #endif
-          if (setsockopt(conn->control_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
-                         sizeof(timeout)) < 0)
+          if (socket_set_timeout_ms(conn->control_socket, SO_SNDTIMEO, 100) < 0)
             debug(1, "Can't set timeout on resend request socket.");
           socklen_t msgsize = sizeof(struct sockaddr_in);
 #ifdef AF_INET6
@@ -1261,6 +1256,7 @@ void rtp_request_resend(seq_t first, uint32_t count, rtsp_conn_info *conn) {
         }
 #endif
         if (response == -1) {
+          socket_set_errno();
           char em[1024];
           strerror_r(errno, em, sizeof(em));
           debug(2, "Error %d using sendto to request a resend: \"%s\".", errno, em);

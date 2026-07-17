@@ -224,6 +224,7 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
         sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 
         if (sockfd == -1) {
+          socket_set_errno();
           // debug(1, "DACP socket could not be created -- error %d:
           // \"%s\".",errno,strerror(errno));
           response.code = 497; // Can't establish a socket to the DACP server
@@ -233,17 +234,15 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
 
           // This is for limiting the time to be spent waiting for a response.
 
-          struct timeval tv;
-          tv.tv_sec = 0;
-          tv.tv_usec = 500000;
-          if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv) == -1)
+          if (socket_set_timeout_ms(sockfd, SO_RCVTIMEO, 500) == -1)
             debug(1, "dacp_send_command: error %d setting receive timeout.", errno);
-          if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv) == -1)
+          if (socket_set_timeout_ms(sockfd, SO_SNDTIMEO, 500) == -1)
             debug(1, "dacp_send_command: error %d setting send timeout.", errno);
 
           // connect!
           // debug(1, "DACP socket created.");
           if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
+            socket_set_errno();
             // debug(1, "dacp_send_command: connect failed with errno %d.", errno);
             if (errno == ECONNREFUSED)
               response.code = 491; // DACP server doesn't want to talk anymore...
@@ -261,6 +260,7 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
             debug(3, "dacp_send_command: \"%s\".", command);
             ssize_t wresp = send(sockfd, message, strlen(message), 0);
             if (wresp == -1) {
+              socket_set_errno();
               char errorstring[1024];
               getErrorText((char *)errorstring, sizeof(errorstring));
               debug(2, "dacp_send_command: write error %d: \"%s\".", errno, (char *)errorstring);
@@ -291,12 +291,13 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
               memset(buffer, 0, sizeof(buffer));
               while (needmore && !looperror) {
                 const char *data = buffer;
-                if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv) == -1)
+                if (socket_set_timeout_ms(sockfd, SO_RCVTIMEO, 500) == -1)
                   debug(1, "dacp_send_command: error %d setting receive timeout.", errno);
                 ssize_t ndata = recv(sockfd, buffer, sizeof(buffer), 0);
                 // debug(3, "Received %d bytes: \"%s\".", ndata, buffer);
                 if (ndata <= 0) {
                   if (ndata == -1) {
+                    socket_set_errno();
                     char errorstring[1024];
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
@@ -929,10 +930,14 @@ void *dacp_monitor_thread_code(__attribute__((unused)) void *na) {
         response = NULL;
       }
       */
-      if (metadata_store.player_thread_active)
-        sleep(config.scan_interval_when_active);
-      else
-        sleep(config.scan_interval_when_inactive);
+      unsigned int scan_interval = metadata_store.player_thread_active
+                                       ? config.scan_interval_when_active
+                                       : config.scan_interval_when_inactive;
+      while (scan_interval-- != 0) {
+        // MinGW sleep() is not a pthread cancellation point.
+        pthread_testcancel();
+        sleep(1);
+      }
     }
   }
   debug(1, "DACP monitor thread exiting -- should never happen.");
