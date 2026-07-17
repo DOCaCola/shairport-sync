@@ -252,7 +252,7 @@ void do_sps_log_to_stderr(__attribute__((unused)) int prio, const char *t, ...) 
   va_start(args, t);
   vsnprintf(s, sizeof(s), t, args);
   va_end(args);
-  fprintf(stderr, "%s\n", s);
+  debug_write_line(stderr, s);
 }
 
 void do_sps_log_to_stdout(__attribute__((unused)) int prio, const char *t, ...) {
@@ -261,7 +261,7 @@ void do_sps_log_to_stdout(__attribute__((unused)) int prio, const char *t, ...) 
   va_start(args, t);
   vsnprintf(s, sizeof(s), t, args);
   va_end(args);
-  fprintf(stdout, "%s\n", s);
+  debug_write_line(stdout, s);
 }
 
 int create_log_file(const char *path) {
@@ -326,7 +326,7 @@ void do_sps_log_to_fd(__attribute__((unused)) int prio, const char *t, ...) {
   if (config.log_fd >= 0) {
     dprintf(config.log_fd, "%s\n", s);
   } else if (errno != ENXIO) { // maybe there is a pipe there but not hooked up
-    fprintf(stderr, "%s\n", s);
+    debug_write_line(stderr, s);
   }
 }
 

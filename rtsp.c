@@ -4555,7 +4555,7 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
       if (conn->fd < 0) {
         debug(1, "Connection %d: New connection on port %d not accepted:", conn->connection_number,
               config.port);
-        perror("failed to accept connection");
+        debug(1, "failed to accept connection: %s", strerror(errno));
 
 #ifndef CONFIG_AIRPLAY_2
         // in Classic AirPlay, close the connection unless idle or interruptions allowed...

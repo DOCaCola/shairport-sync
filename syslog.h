@@ -4,6 +4,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "utilities/debug.h"
+
 #define LOG_EMERG 0
 #define LOG_ALERT 1
 #define LOG_CRIT 2
@@ -37,11 +39,12 @@ static inline void closelog(void) {
 
 static inline void syslog(int priority, const char *format, ...) {
   (void)priority;
+  char message[16384];
   va_list args;
   va_start(args, format);
-  vfprintf(stderr, format, args);
-  fputc('\n', stderr);
+  vsnprintf(message, sizeof(message), format, args);
   va_end(args);
+  debug_write_line(stderr, message);
 }
 
 #endif

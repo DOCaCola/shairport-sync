@@ -654,7 +654,8 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
 
   *outputsize = outputsamples * alac->bytespersample;
   if (*outputsize > outbuffer_allocation_size) {
-    fprintf(stderr, "FIXME: Not enough space if the output buffer for audio frame - E1.\n");
+    debug_write_formatted_line(stderr,
+                               "FIXME: Not enough space if the output buffer for audio frame - E1.");
     *outputsize = 0;
     return;
   }
@@ -689,7 +690,8 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
       outputsamples = readbits(alac, 32);
       *outputsize = outputsamples * alac->bytespersample;
       if (*outputsize > outbuffer_allocation_size) {
-        fprintf(stderr, "FIXME: Not enough space if the output buffer for audio frame - E2.\n");
+        debug_write_formatted_line(
+            stderr, "FIXME: Not enough space if the output buffer for audio frame - E2.");
         *outputsize = 0;
         return;
       }
@@ -737,8 +739,9 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
                                        outputsamples, readsamplesize, predictor_coef_table,
                                        predictor_coef_num, prediction_quantitization);
       } else {
-        fprintf(stderr, "FIXME: unhandled prediction type for compressed case: %i\n",
-                prediction_type);
+        debug_write_formatted_line(stderr,
+                                   "FIXME: unhandled prediction type for compressed case: %i",
+                                   prediction_type);
         /* i think the only other prediction type (or perhaps this is just a
          * boolean?) runs adaptive fir twice.. like:
          * predictor_decompress_fir_adapt(predictor_error, tempout, ...)
@@ -806,7 +809,8 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
     }
     case 20:
     case 32:
-      fprintf(stderr, "FIXME: unimplemented sample size %i\n", alac->setinfo_sample_size);
+      debug_write_formatted_line(stderr, "FIXME: unimplemented sample size %i",
+                                 alac->setinfo_sample_size);
       break;
     default:
       break;
@@ -844,7 +848,8 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
       outputsamples = readbits(alac, 32);
       *outputsize = outputsamples * alac->bytespersample;
       if (*outputsize > outbuffer_allocation_size) {
-        fprintf(stderr, "FIXME: Not enough space if the output buffer for audio frame - E3.\n");
+        debug_write_formatted_line(
+            stderr, "FIXME: Not enough space if the output buffer for audio frame - E3.");
         *outputsize = 0;
         return;
       }
@@ -914,7 +919,9 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
                                        outputsamples, readsamplesize, predictor_coef_table_a,
                                        predictor_coef_num_a, prediction_quantitization_a);
       } else { /* see mono case */
-        fprintf(stderr, "FIXME: unhandled prediction type on channel 1: %i\n", prediction_type_a);
+        debug_write_formatted_line(stderr,
+                                   "FIXME: unhandled prediction type on channel 1: %i",
+                                   prediction_type_a);
       }
 
       /* channel 2 */
@@ -928,7 +935,9 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
                                        outputsamples, readsamplesize, predictor_coef_table_b,
                                        predictor_coef_num_b, prediction_quantitization_b);
       } else {
-        fprintf(stderr, "FIXME: unhandled prediction type on channel 2: %i\n", prediction_type_b);
+        debug_write_formatted_line(stderr,
+                                   "FIXME: unhandled prediction type on channel 2: %i",
+                                   prediction_type_b);
       }
     } else { /* not compressed, easy case */
       if (alac->setinfo_sample_size <= 16) {
@@ -985,7 +994,8 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
     }
     case 20:
     case 32:
-      fprintf(stderr, "FIXME: unimplemented sample size %i\n", alac->setinfo_sample_size);
+      debug_write_formatted_line(stderr, "FIXME: unimplemented sample size %i",
+                                 alac->setinfo_sample_size);
       break;
     default:
       break;
@@ -1004,7 +1014,8 @@ alac_file *alac_create(int samplesize, int numchannels) {
     newfile->numchannels = numchannels;
     newfile->bytespersample = (samplesize / 8) * numchannels;
   } else {
-    fprintf(stderr, "FIXME: can not allocate memory for a new file in alac_cxreate.");
+    debug_write_formatted_line(stderr,
+                               "FIXME: can not allocate memory for a new file in alac_cxreate.");
   }
   return newfile;
 }
