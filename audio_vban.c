@@ -29,9 +29,9 @@
 #include "audio.h"
 #include "common.h"
 #include "config.h"
-#include "utilities/network_utilities.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,11 +40,13 @@
 #ifdef CONFIG_FOR_MINGW
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -64,7 +66,15 @@ static int port = VBAN_DEFAULT_PORT;
 static char stream_name[VBAN_STREAM_NAME_SIZE] = {0};
 static int stream_name_truncated = 0;
 
-static int fd = -1;
+#ifdef CONFIG_FOR_MINGW
+typedef SOCKET vban_socket_t;
+#define VBAN_INVALID_SOCKET INVALID_SOCKET
+#else
+typedef int vban_socket_t;
+#define VBAN_INVALID_SOCKET (-1)
+#endif
+
+static vban_socket_t fd = VBAN_INVALID_SOCKET;
 static struct sockaddr_storage remote_address;
 static socklen_t remote_address_length = 0;
 
@@ -76,7 +86,19 @@ static unsigned int samples_per_packet = 0;
 static uint8_t vban_sample_rate_index = 0;
 static uint8_t vban_bit_format = 0;
 static uint32_t frame_counter = 0;
-static int warned = 0;
+static uint8_t buffered_audio[VBAN_DATA_MAX_SIZE];
+static unsigned int buffered_samples = 0;
+static uint64_t buffered_playtime = 0;
+static int buffered_playtime_valid = 0;
+static int buffered_contains_timed_samples = 0;
+static uint64_t next_packet_time = 0;
+static uint64_t pacing_remainder = 0;
+static int next_packet_time_valid = 0;
+static uint64_t failed_packets_in_burst = 0;
+
+#ifdef CONFIG_FOR_MINGW
+static HANDLE pacing_timer = NULL;
+#endif
 
 static int socket_errno(void) {
 #ifdef CONFIG_FOR_MINGW
@@ -84,6 +106,74 @@ static int socket_errno(void) {
 #else
   return errno;
 #endif
+}
+
+static int socket_is_open(void) { return fd != VBAN_INVALID_SOCKET; }
+
+static void close_socket(void) {
+  if (socket_is_open()) {
+#ifdef CONFIG_FOR_MINGW
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+    fd = VBAN_INVALID_SOCKET;
+  }
+}
+
+static void reset_packetizer(void) {
+  buffered_samples = 0;
+  buffered_playtime = 0;
+  buffered_playtime_valid = 0;
+  buffered_contains_timed_samples = 0;
+  next_packet_time = 0;
+  pacing_remainder = 0;
+  next_packet_time_valid = 0;
+}
+
+static uint64_t frames_to_ns(uint64_t frames) {
+  return (frames * 1000000000ULL) / configured_rate;
+}
+
+static uint64_t advance_packet_time(uint64_t packet_time, unsigned int frames) {
+  uint64_t numerator = frames * 1000000000ULL + pacing_remainder;
+  packet_time += numerator / configured_rate;
+  pacing_remainder = numerator % configured_rate;
+  return packet_time;
+}
+
+static int wait_until(uint64_t target_time) {
+  while (1) {
+    uint64_t now = get_absolute_time_in_ns();
+    if (now >= target_time)
+      return 0;
+
+    uint64_t wait_ns = target_time - now;
+#ifdef CONFIG_FOR_MINGW
+    LARGE_INTEGER due_time;
+    due_time.QuadPart = -(LONGLONG)((wait_ns + 99) / 100);
+    if (SetWaitableTimer(pacing_timer, &due_time, 0, NULL, NULL, FALSE) == 0) {
+      warn("vban: error %lu setting the packet pacing timer.", GetLastError());
+      return -1;
+    }
+    DWORD wait_result = WaitForSingleObject(pacing_timer, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) {
+      warn("vban: error %lu waiting for the packet pacing timer.", GetLastError());
+      return -1;
+    }
+#else
+    struct timespec request = {.tv_sec = wait_ns / 1000000000ULL,
+                               .tv_nsec = wait_ns % 1000000000ULL};
+    int sleep_response;
+    do {
+      sleep_response = nanosleep(&request, &request);
+    } while ((sleep_response != 0) && (errno == EINTR));
+    if (sleep_response != 0) {
+      warn("vban: error %d waiting for the packet pacing timer.", errno);
+      return -1;
+    }
+#endif
+  }
 }
 
 static int vban_rate_index(unsigned int rate) {
@@ -134,7 +224,7 @@ static int vban_bit_format_for_sps_format(sps_format_t format, uint8_t *bit_form
 }
 
 static int open_socket(void) {
-  if (fd != -1)
+  if (socket_is_open())
     return 0;
 
   char port_string[16];
@@ -152,7 +242,7 @@ static int open_socket(void) {
 
   for (struct addrinfo *p = info; p != NULL; p = p->ai_next) {
     fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (fd == -1)
+    if (!socket_is_open())
       continue;
 
     memcpy(&remote_address, p->ai_addr, p->ai_addrlen);
@@ -162,7 +252,7 @@ static int open_socket(void) {
 
   freeaddrinfo(info);
 
-  if (fd == -1)
+  if (!socket_is_open())
     die("vban: can not create UDP socket for destination \"%s\".", destination);
 
   return 0;
@@ -238,10 +328,26 @@ static int init(int argc, char **argv) {
   if (stream_name_truncated)
     warn("vban.stream_name is longer than %d bytes and has been truncated.", VBAN_STREAM_NAME_SIZE);
 
+#ifdef CONFIG_FOR_MINGW
+  pacing_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_ALL_ACCESS);
+  if (pacing_timer == NULL)
+    die("vban: can not create the high-resolution packet pacing timer: error %lu.",
+        GetLastError());
+#endif
+
   return open_socket();
 }
 
-static void deinit(void) { safe_socket_close(&fd); }
+static void deinit(void) {
+  close_socket();
+#ifdef CONFIG_FOR_MINGW
+  if (pacing_timer != NULL) {
+    CloseHandle(pacing_timer);
+    pacing_timer = NULL;
+  }
+#endif
+}
 
 static int32_t get_configuration(unsigned int channels, unsigned int rate, unsigned int format) {
   sps_format_t selected_format = native_format((sps_format_t)format);
@@ -288,7 +394,8 @@ static int configure(int32_t requested_encoded_format, __attribute__((unused)) c
 
   vban_sample_rate_index = (uint8_t)rate_index;
   frame_counter = 0;
-  warned = 0;
+  failed_packets_in_burst = 0;
+  reset_packetizer();
 
   debug(1, "vban: setting output configuration to %s.", short_format_description(requested_encoded_format));
   return 0;
@@ -319,17 +426,49 @@ static int send_packet(const uint8_t *audio, unsigned int samples) {
 
   int response = sendto(fd, (const char *)packet, VBAN_HEADER_SIZE + payload_size, 0,
                         (struct sockaddr *)&remote_address, remote_address_length);
-  if ((response < 0) && (warned == 0)) {
-    warn("vban: error %d sending UDP packet.", socket_errno());
-    warned = 1;
+  if (response < 0) {
+    int error = socket_errno();
+    if (failed_packets_in_burst == 0)
+      warn("vban: error %d sending UDP packet; packet loss burst started.", error);
+    failed_packets_in_burst++;
+    return -1;
+  }
+
+  if (failed_packets_in_burst != 0) {
+    warn("vban: UDP output recovered after %" PRIu64 " failed packets.",
+         failed_packets_in_burst);
+    failed_packets_in_burst = 0;
   }
   return response;
 }
 
-static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
-                __attribute__((unused)) uint32_t timestamp,
-                __attribute__((unused)) uint64_t playtime) {
-  if ((fd == -1) && (open_socket() != 0))
+static int send_buffered_packet(void) {
+  uint64_t packet_time;
+  if (buffered_playtime_valid != 0) {
+    packet_time = buffered_playtime;
+    pacing_remainder = 0;
+  } else if (next_packet_time_valid != 0) {
+    packet_time = next_packet_time;
+  } else {
+    packet_time = get_absolute_time_in_ns();
+  }
+
+  int response = wait_until(packet_time);
+  if (response == 0)
+    response = send_packet(buffered_audio, buffered_samples);
+
+  next_packet_time = advance_packet_time(packet_time, buffered_samples);
+  next_packet_time_valid = 1;
+  buffered_samples = 0;
+  buffered_playtime = 0;
+  buffered_playtime_valid = 0;
+  buffered_contains_timed_samples = 0;
+  return response < 0 ? -1 : 0;
+}
+
+static int play(void *buf, int samples, int sample_type,
+                __attribute__((unused)) uint32_t timestamp, uint64_t playtime) {
+  if ((!socket_is_open()) && (open_socket() != 0))
     return -1;
   if ((bytes_per_frame == 0) || (samples_per_packet == 0)) {
     debug(1, "vban: output format not configured before play().");
@@ -338,18 +477,46 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
 
   const uint8_t *audio = buf;
   int samples_remaining = samples;
+  unsigned int samples_consumed = 0;
+  int response = 0;
+
   while (samples_remaining > 0) {
-    unsigned int chunk = samples_remaining > (int)samples_per_packet ? samples_per_packet
-                                                                     : (unsigned int)samples_remaining;
-    send_packet(audio, chunk);
+    if (buffered_samples == 0) {
+      if (sample_type == play_samples_are_timed) {
+        buffered_playtime = playtime + frames_to_ns(samples_consumed);
+        buffered_playtime_valid = 1;
+        buffered_contains_timed_samples = 1;
+      }
+    } else if ((sample_type == play_samples_are_timed) &&
+               (buffered_contains_timed_samples == 0)) {
+      buffered_playtime =
+          playtime + frames_to_ns(samples_consumed) - frames_to_ns(buffered_samples);
+      buffered_playtime_valid = 1;
+      buffered_contains_timed_samples = 1;
+    }
+
+    unsigned int space = samples_per_packet - buffered_samples;
+    unsigned int chunk =
+        samples_remaining > (int)space ? space : (unsigned int)samples_remaining;
+    memcpy(buffered_audio + buffered_samples * bytes_per_frame, audio,
+           chunk * bytes_per_frame);
+    buffered_samples += chunk;
     audio += chunk * bytes_per_frame;
     samples_remaining -= chunk;
+    samples_consumed += chunk;
+
+    if ((buffered_samples == samples_per_packet) && (send_buffered_packet() != 0))
+      response = -1;
   }
 
-  return 0;
+  return response;
 }
 
-static void flush(void) { frame_counter = 0; }
+static void flush(void) {
+  frame_counter = 0;
+  failed_packets_in_burst = 0;
+  reset_packetizer();
+}
 
 audio_output audio_vban = {.name = "vban",
                            .help = &help,
