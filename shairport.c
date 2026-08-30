@@ -89,6 +89,7 @@
 #include "rtp.h"
 #include "rtsp.h"
 #include "utilities/string_utilities.h"
+#include "utilities/exit.h"
 
 #if defined(CONFIG_DACP_CLIENT)
 #include "dacp.h"
@@ -145,6 +146,10 @@ int this_is_the_daemon_process = 0;
 #define strnull(s) ((s) ? (s) : "(null)")
 
 pthread_t rtsp_listener_thread;
+
+#if defined(CONFIG_DBUS_INTERFACE) || defined(CONFIG_MPRIS_INTERFACE)
+GMainLoop *glib_worker_loop = NULL;
+#endif
 
 int killOption = 0;
 int daemonisewith = 0;
@@ -459,7 +464,7 @@ int parse_options(int argc, char **argv) {
       break;
     case 'u':
       inform("Warning: the option -u is no longer needed and is deprecated. Debug and statistics "
-             "output to STDERR is now the default. Use \"--log-to-syslog\" to revert.");
+             "output to STDERR is now the default.");
       break;
     case 'D':
       inform("Warning: the option -D or --disconnectFromOutput is deprecated.");
@@ -495,6 +500,7 @@ int parse_options(int argc, char **argv) {
     }
   }
   if (c < -1) {
+    debug(1, "Oops");
     die("%s: %s", poptBadOption(optCon, POPT_BADOPTION_NOALIAS), poptStrerror(c));
   }
 
@@ -509,16 +515,15 @@ int parse_options(int argc, char **argv) {
   }
 
   if (log_to_syslog_selected) {
-    // if this was the first command line argument, it'll already have been chosen
-    if (log_to_syslog_select_is_first_command_line_argument == 0) {
-      inform("Suggestion: make \"--log-to-syslog\" the first command line argument to ensure "
-             "messages go to the syslog right from the beginning.");
-    }
+    inform("the diagnostic \"log-to-syslog\" command_line_option is obsolete and is ignored. All logging is to STDERR, which is directed to the system log when Shairport Sync is running as a service.");
+/*
 #ifdef CONFIG_LIBDAEMON
     log_to_default = 0; // a specific log output modality has been selected.
 #endif
     log_to_syslog();
+*/
   }
+
 
 #ifdef CONFIG_LIBDAEMON
   if ((daemonisewith) && (daemonisewithout))
@@ -579,9 +584,6 @@ int parse_options(int argc, char **argv) {
   else
 #endif
     config.firmware_version = strdup(PACKAGE_VERSION);
-
-  free(config.firmware_version);
-  config.firmware_version = strdup("5.2");
 
 #ifdef CONFIG_METADATA
   /* Get the metadata setting. */
@@ -777,6 +779,17 @@ int parse_options(int argc, char **argv) {
               "inclusive.",
               value);
       }
+      
+      if (config_lookup_string(config.cfg, "diagnostics.get_plist_metadata", &str)) {
+        if (strcasecmp(str, "no") == 0)
+          config.get_plist_metadata = 0;
+        else if (strcasecmp(str, "yes") == 0)
+          config.get_plist_metadata = 1;
+        else
+          die("Invalid \"get_plist_metadata\" option choice \"%s\". It should be \"yes\" or "
+              "\"no\"",
+              str);
+      }
 
       /* Get the verbosity setting. */
       if (config_lookup_int(config.cfg, "diagnostics.log_verbosity", &value)) {
@@ -866,6 +879,7 @@ int parse_options(int argc, char **argv) {
 
       /* Get the diagnostics output default. */
       if (config_lookup_string(config.cfg, "diagnostics.log_output_to", &str)) {
+      /*
 #ifdef CONFIG_LIBDAEMON
         log_to_default = 0; // a specific log output modality has been selected.
 #endif
@@ -880,7 +894,11 @@ int parse_options(int argc, char **argv) {
           config.log_fd = -1;
           log_to_file();
         }
+      */
+        warn("the diagnostic \"log_output_to\" setting is obsolete and is ignored. All logging is to STDERR, which is directed to the system log when Shairport Sync is running as a service.");
       }
+      
+      
       /* Get the ignore_volume_control setting. */
       if (config_lookup_string(config.cfg, "general.ignore_volume_control", &str)) {
         if (strcasecmp(str, "no") == 0)
@@ -1636,17 +1654,22 @@ int parse_options(int argc, char **argv) {
   // provides much more information, so should be the default for AirPlay 2
 
   if (config.metadata_enabled != 0) {
-    config.airplay_features |=
-        (uint64_t)1 << 50; // metadata in a binary plist, including more state information
-    // config.airplay_features |= ((uint64_t)1 << 15) | ((uint64_t)1 << 16) | ((uint64_t)1 << 17);
-    // // older metadata flags artwork, progress and text respectively
+    if (config.get_plist_metadata != 0) {
+      config.airplay_features |=
+        (uint64_t)1 << 50; // richer metadata in a binary plist, including more state information
+    } else {
+      // older metadata flags artwork, progress and text respectively
+      config.airplay_features |= (((uint64_t)1 << 16) | ((uint64_t)1 << 17));
+      if (config.get_coverart != 0)
+        config.airplay_features |= ((uint64_t)1 << 15);
+    }
   }
 #endif
 
   // now generate the fex field
   uint8_t fexbytes[8];
   uint64_t temp = config.airplay_features;
-  debug(2, "airplay_features are %" PRIx64 ".", temp);
+  debug(4, "airplay_features are %" PRIx64 ".", temp);
   for (i = 0; i < 8; i++) {
     fexbytes[i] = temp & 0xff;
     temp = temp >> 8;
@@ -1847,7 +1870,7 @@ GThread *glib_worker_thread = NULL;
 gpointer glib_worker_thread_function(__attribute__((unused)) gpointer data) {
 
   // use the default global-default main context
-  config.glib_worker_loop = g_main_loop_new(NULL, FALSE);
+  glib_worker_loop = g_main_loop_new(NULL, FALSE);
 
   // debug(1, "glib worker thread started.");
 
@@ -1862,7 +1885,7 @@ gpointer glib_worker_thread_function(__attribute__((unused)) gpointer data) {
 
   // debug(1, "g_main_loop_run start.");
 
-  g_main_loop_run(config.glib_worker_loop);
+  g_main_loop_run(glib_worker_loop);
 
   // debug(1, "g_main_loop_run exit.");
 
@@ -1878,11 +1901,7 @@ gpointer glib_worker_thread_function(__attribute__((unused)) gpointer data) {
   // debug(1, "stopped D-Bus service");
 #endif
 
-  g_main_loop_unref(config.glib_worker_loop);
-  if (config.quit_requested_from_glib_mainloop != 0) {
-    debug(2, "glib_mainloop_thread_function asking for exit");
-    exit(EXIT_SUCCESS);
-  }
+  g_main_loop_unref(glib_worker_loop);
   return NULL;
 }
 
@@ -1899,21 +1918,19 @@ const char *pid_file_proc(void) {
 }
 #endif
 
+
 void exit_rtsp_listener() {
   debug(3, "exit_rtsp_listener begins");
-  if (type_of_exit_cleanup != TOE_emergency) {
-    rtsp_request_listen_loop_exit();
-    pthread_cancel(rtsp_listener_thread);
-    if (pthread_equal(pthread_self(), rtsp_listener_thread) == 0)
-      pthread_join(rtsp_listener_thread, NULL); // not sure you need this
-    else
-      debug(2, "exit_rtsp_listener skipping join of current thread.");
-  }
+  rtsp_request_listen_loop_exit();
+  pthread_cancel(rtsp_listener_thread);
+  if (pthread_equal(pthread_self(), rtsp_listener_thread) == 0)
+    pthread_join(rtsp_listener_thread, NULL);
+  else
+    debug(2, "exit_rtsp_listener skipping join of current thread.");
   debug(2, "exit_rtsp_listener ends");
 }
 
 void exit_function() {
-  if (type_of_exit_cleanup != TOE_emergency) {
     // the following is to ensure that if libdaemon has been included
     // that most of this code will be skipped when the parent process is exiting
     // exec
@@ -1942,10 +1959,15 @@ void exit_function() {
 #endif
 
 #if defined(CONFIG_DBUS_INTERFACE) || defined(CONFIG_MPRIS_INTERFACE)
-      if ((glib_worker_thread != NULL) && (config.quit_requested_from_glib_mainloop == 0)) {
-        g_main_loop_quit(config.glib_worker_loop);
-        debug(2, "GMainLoop stop requested");
-      }
+        if (glib_worker_loop != NULL) { // may not have been initialised
+          g_main_loop_quit(glib_worker_loop);
+          debug(2, "GMainLoop stop requested");
+        }
+        if (glib_worker_thread != NULL) {
+          g_thread_join(glib_worker_thread);
+          debug(2, "GLib worker thread joined");
+        }
+
 #endif
 
 #ifdef CONFIG_METADATA_HUB
@@ -2048,6 +2070,8 @@ void exit_function() {
 
 #ifdef CONFIG_LIBDAEMON
     if (this_is_the_daemon_process) { // this is the daemon that is exiting
+      mdns_unregister(); // once the dacp handler is done and all player threrads are done it should
+                       // be safe
       debug(1, "libdaemon daemon process exit");
     } else {
       if (config.daemonise)
@@ -2056,13 +2080,10 @@ void exit_function() {
         debug(1, "normal exit");
     }
 #else
-    mdns_unregister(); // once the dacp handler is done and all player threrads are done it should
+    mdns_unregister(); // once the dacp handler is done and all player threads are done it should
                        // be safe
     debug(2, "normal exit");
 #endif
-  } else {
-    debug(1, "emergency exit");
-  }
 }
 
 // for removing zombie script processes
@@ -2083,12 +2104,12 @@ void handle_sigchld(__attribute__((unused)) int sig) {
 // for clean exits
 void intHandler(__attribute__((unused)) int k) {
   debug(2, "exit on SIGINT");
-  exit(EXIT_SUCCESS);
+  exit_request(EXIT_SUCCESS);
 }
 
 void termHandler(__attribute__((unused)) int k) {
   debug(2, "exit on SIGTERM");
-  exit(EXIT_SUCCESS);
+  exit_request(EXIT_SUCCESS);
 }
 
 void _display_config(const char *filename, const int linenumber, __attribute__((unused)) int argc,
@@ -2350,9 +2371,10 @@ const char *av_channel_layout_name(uint64_t channel_layout) {
 #endif
 
 int main(int argc, char **argv) {
+  exit_init(); // initialise the exit handler to give us a clean safe exit on request
   // initialise debug messages stuff -- level 0, no elapsed time, relative time, file and line
   // debug_init(int level, int show_elapsed_time, int show_relative_time, int show_file_and_line)
-  debug_init(0, 0, 1, 1);
+  debug_init(0, 0, 1, 1, exit_request);
   memset(&config, 0, sizeof(config)); // also clears all strings, BTW
   /* Check if we are called with -V or --version parameter */
   if (argc >= 2 && ((strcmp(argv[1], "-V") == 0) || (strcmp(argv[1], "--version") == 0))) {
@@ -2395,13 +2417,15 @@ int main(int argc, char **argv) {
     exit(EXIT_SUCCESS);
   }
 
-  /* Check if we are called with -log-to-syslog */
+/*
+  // Check if we are called with -log-to-syslog
   if (argc >= 2 && (strcmp(argv[1], "--log-to-syslog") == 0)) {
     log_to_syslog_select_is_first_command_line_argument = 1;
     log_to_syslog();
   } else {
     log_to_stderr();
   }
+*/
 
   pid = getpid();
   config.log_fd = -1;
@@ -2412,7 +2436,6 @@ int main(int argc, char **argv) {
   setlogmask(LOG_UPTO(LOG_DEBUG));
   openlog(NULL, 0, LOG_DAEMON);
 #endif
-  type_of_exit_cleanup = TOE_normal; // what kind of exit cleanup needed
 #ifdef CONFIG_FOR_MINGW
   if (shairport_mingw_winsock_init() != 0)
     die("Could not initialise Winsock.");
@@ -2479,8 +2502,8 @@ int main(int argc, char **argv) {
   config.packet_stuffing = ST_vernier; // you need to explicitly ask for "basic" (ST_basic)
 #endif
 
-  set_requested_connection_state_to_output(
-      1); // we expect to be able to connect to the output device
+  // set_requested_connection_state_to_output(
+  //     1); // we expect to be able to connect to the output device
   config.audio_backend_buffer_desired_length = 0.15; // seconds
   config.audio_decoded_buffer_desired_length = 0.75; // seconds
   config.udp_port_base = 6001;
@@ -2623,8 +2646,10 @@ int main(int argc, char **argv) {
     } else { /* pid == 0 means we are the daemon */
 
       this_is_the_daemon_process = 1;
+/*
       if (log_to_default != 0) // if a specific logging mode has not been selected
         log_to_syslog();       // automatically send logs to the daemon_log
+*/
 
       /* Close FDs */
       if (daemon_close_all(-1) < 0) {
@@ -3379,6 +3404,10 @@ int main(int argc, char **argv) {
   // you'll see two threads named "listener" or whatever...
   named_pthread_create(&rtsp_listener_thread, NULL, &rtsp_listen_loop, NULL, "listener");
   atexit(exit_rtsp_listener);
-  pthread_join(rtsp_listener_thread, NULL);
+  
+  // wait forever...
+  while (1) {
+    usleep(1000000);
+  }
   return 0;
 }

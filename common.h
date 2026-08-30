@@ -52,11 +52,6 @@ typedef enum {
 } dbus_message_bus_t;
 #endif
 
-typedef enum {
-  TOE_normal,
-  TOE_emergency,
-} type_of_exit_type;
-
 #define sps_extra_code_output_stalled 32768
 #define sps_extra_code_output_state_cannot_make_ready 32769
 
@@ -198,6 +193,8 @@ typedef struct {
   double resend_control_check_interval_time; // wait this long between making requests
   double resend_control_last_check_time; // if the packet is missing this close to the time of use,
                                          // give up
+                                         
+  int get_plist_metadata; // set to non-zero to get richer plist metadata
   pthread_mutex_t lock;
   config_t *cfg;
   int endianness;
@@ -216,6 +213,7 @@ typedef struct {
 
   char *pa_sink; // the name (or id) of the sink that Shairport Sync will play on.
 #endif
+
 #ifdef CONFIG_PIPEWIRE
   char *pw_application_name; // the name under which Shairport Sync shows up as an "Application" in
                              // the Sound Preferences in most desktop Linuxes.
@@ -224,6 +222,7 @@ typedef struct {
   char *pw_node_name;   // defaults to the application's name, usually "shairport-sync".
   char *pw_sink_target; // leave this unset if you don't want to change the sink_target.
 #endif
+
 #ifdef CONFIG_METADATA
   int metadata_enabled;
   char *metadata_pipename;
@@ -233,6 +232,7 @@ typedef struct {
   int get_coverart;
   double metadata_progress_interval; // 0 means no progress reports
 #endif
+
 #ifdef CONFIG_MQTT
   int mqtt_enabled;
   char *mqtt_hostname;
@@ -253,6 +253,7 @@ typedef struct {
   char *mqtt_autodiscovery_prefix;
   char *mqtt_empty_payload_substitute;
 #endif
+
   uint8_t ap1_prefix[6];
   uint8_t hw_addr[8]; // only needs 6 but 8 is handy when converting this to a number
   int port;
@@ -305,8 +306,6 @@ typedef struct {
                             // to be enabled under the auto setting
   int decoders_supported;
   int decoder_in_use;
-  // char *logfile;
-  // char *errfile;
   char *configfile;
   char *regtype; // The regtype is the service type followed by the protocol, separated by a dot, by
                  // default “_raop._tcp.” for AirPlay 1.
@@ -351,17 +350,11 @@ typedef struct {
 
 #ifdef CONFIG_CONVOLUTION
   int convolution_enabled;
-  unsigned int convolution_rate; // 0 means the convolver has never been initialised, so ignore
-                                 // convolver_valid.
-  // but if this is the same as the current rate and convolver_valid is false, it means that an
-  // attempt to initialise the convolver has failed.
-  size_t convolution_block_size;
   unsigned int convolution_ir_file_count;
   ir_file_info_t *convolution_ir_files; // NULL or an array of information about all the impulse
                                         // response files loaded
   int convolution_ir_files_updated; // set to true if the convolution_ir_files are changed. Cleared
                                     // when the convolver has been initialised
-  int convolver_valid;              // set to true if the convolver can be initialised
   unsigned int convolution_threads; // number of threads in the convolver thread pool
   float convolution_gain;
   double convolution_max_length_in_seconds;
@@ -388,6 +381,7 @@ typedef struct {
   int scan_max_inactive_count;     // number of scans to do before stopping if not made active again
                                    // (about 15 minutes worth)
 #endif
+
   int disable_resend_requests; // set this to stop resend request being made for missing packets
   double diagnostic_drop_packet_fraction; // pseudo randomly drop this fraction of packets, for
                                           // debugging. Currently audio packets only...
@@ -398,10 +392,11 @@ typedef struct {
   int jack_soxr_resample_quality;
 #endif
 #endif
+
   void *gradients; // a linked list of the clock gradients discovered for all DACP IDs
                    // can't use IP numbers as they might be given to different devices
                    // can't get hold of MAC addresses.
-                   // can't define the nvll linked list struct here
+                   // can't define the null linked list struct here
   char *firmware_version;
   // use these in information requests
   char *model;
@@ -438,14 +433,12 @@ typedef struct {
   unsigned int output_channel_map_size; // number of output channels
 
 #if defined(CONFIG_DBUS_INTERFACE) || defined(CONFIG_MPRIS_INTERFACE)
-  GMainLoop *glib_worker_loop;
-  // for clean quitting from a dbus interface quit request (from the DBus or MPRIS interfaces)
-  int quit_requested_from_glib_mainloop; // remember that it initialised to zero.
   dbus_message_bus_t dbus_default_message_bus;
 
 #if defined(CONFIG_DBUS_INTERFACE)
   dbus_message_bus_t dbus_service_bus_type;
 #endif
+
 #if defined(CONFIG_MPRIS_INTERFACE)
   dbus_message_bus_t mpris_service_bus_type;
 #endif
@@ -457,19 +450,6 @@ typedef struct {
 uint32_t nctohl(const uint8_t *p);  // read 4 characters from *p and do ntohl on them
 uint16_t nctohs(const uint8_t *p);  // read 2 characters from *p and do ntohs on them
 uint64_t nctoh64(const uint8_t *p); // read 8 characters from *p to a uint64_t
-
-void memory_barrier();
-
-void log_to_stderr(); // call this to direct logging to stderr;
-void log_to_stdout(); // call this to direct logging to stdout;
-void log_to_syslog(); // call this to direct logging to the system log;
-void log_to_file();   // call this to direct logging to a file or (pre-existing) pipe;
-
-// true if Shairport Sync is supposed to be sending output to the output device, false otherwise
-
-int get_requested_connection_state_to_output();
-
-void set_requested_connection_state_to_output(int v);
 
 int try_to_open_pipe_for_writing(
     const char *pathname); // open it without blocking if it's not hooked up
@@ -504,14 +484,6 @@ extern volatile int debuglev;
     X;                                                                                             \
     MADEID(once_flag_, __LINE__) = 1;                                                              \
   }
-
-// do X once, and then ignore repeated calls until they stop for more than one second
-#define once_per_1_second_burst(X)                                                                 \
-  static uint64_t MADEID(time_, __LINE__) = 0;                                                     \
-  int64_t MADEID(interval_, __LINE__) = get_absolute_time_in_ns() - MADEID(time_, __LINE__);       \
-  if ((MADEID(time_, __LINE__) == 0) || (MADEID(interval_, __LINE__) > 1000000000L))               \
-    X;                                                                                             \
-  MADEID(time_, __LINE__) = get_absolute_time_in_ns()
 
 void getErrorText(char *destinationString, size_t destinationStringLength);
 
@@ -558,7 +530,6 @@ uint32_t uatoi(const char *nptr);
 
 extern shairport_cfg config;
 extern config_t config_file_stuff;
-extern int type_of_exit_cleanup; // normal, emergency, dbus requested...
 
 extern uint64_t minimum_dac_queue_size;
 
@@ -581,46 +552,9 @@ void command_set_volume(double volume);
 
 int mkpath(const char *path, mode_t mode);
 
-void sps_shutdown(type_of_exit_type shutdown_type); // TOE_normal, TOE_emergency, TOE_dbus
-
-#ifndef CONFIG_FOR_MINGW
-extern sigset_t pselect_sigset;
-#endif
-
-extern pthread_mutex_t the_conn_lock;
-
-#define conn_lock(arg)                                                                             \
-  pthread_mutex_lock(&the_conn_lock);                                                              \
-  arg;                                                                                             \
-  pthread_mutex_unlock(&the_conn_lock);
-
-// wait for the specified time in microseconds -- it checks every 20 milliseconds
-// int sps_pthread_mutex_timedlock(pthread_mutex_t *mutex, useconds_t dally_time,
-//                                 const char *debugmessage, int debuglevel);
-// wait for the specified time, checking every 20 milliseconds, and block if it can't acquire the
-// lock
-int _debug_mutex_lock(pthread_mutex_t *mutex, useconds_t dally_time, const char *mutexName,
-                      const char *filename, const int line, int debuglevel);
-
-#define debug_mutex_lock(mu, t, d) _debug_mutex_lock(mu, t, #mu, __FILE__, __LINE__, d)
-
-int _debug_mutex_unlock(pthread_mutex_t *mutex, const char *mutexName, const char *filename,
-                        const int line, int debuglevel);
-
-#define debug_mutex_unlock(mu, d) _debug_mutex_unlock(mu, #mu, __FILE__, __LINE__, d)
-
-void pthread_cleanup_debug_mutex_unlock(void *arg);
-
-#define pthread_cleanup_debug_mutex_lock(mu, t, d)                                                 \
-  if (_debug_mutex_lock(mu, t, #mu, __FILE__, __LINE__, d) == 0)                                   \
-  pthread_cleanup_push(pthread_cleanup_debug_mutex_unlock, (void *)mu)
-
-#define config_lock                                                                                \
-  if (pthread_mutex_trylock(&config.lock) != 0) {                                                  \
-    debug(1, "config_lock: cannot acquire config.lock");                                           \
-  }
-
-#define config_unlock pthread_mutex_unlock(&config.lock)
+#define pthread_mutex_lock_and_cleanup_push(mu)                                                 \
+  if (pthread_mutex_lock(mu) == 0)                                   \
+  pthread_cleanup_push(mutex_unlock, (void *)mu)
 
 int do_pthread_setname(pthread_t *restrict thread, const char *format, ...);
 
@@ -642,7 +576,6 @@ char *get_version_string(); // mallocs a string space -- remember to free it aft
 int64_t generate_zero_frames(char *outp, size_t number_of_frames, int with_dither,
                              int64_t random_number_in, uint32_t encoded_output_format);
 
-void malloc_cleanup(void *arg);
 
 int string_update_with_size(char **str, int *flag, char *s, size_t len);
 
@@ -654,10 +587,14 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
 
 uint16_t bind_UDP_port(int ip_family, const char *self_ip_address, uint32_t scope_id, int *sock);
 
+// for pthread_push and pop
+// careful with the difference between cleanup and unlock!
+
+void malloc_cleanup(void *arg);
 void socket_cleanup(void *arg);
 void mutex_unlock(void *arg);
-void rwlock_unlock(void *arg);
 void mutex_cleanup(void *arg);
+void rwlock_unlock(void *arg);
 void cv_cleanup(void *arg);
 void thread_cleanup(void *arg);
 #ifdef CONFIG_AIRPLAY_2
