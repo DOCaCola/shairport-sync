@@ -128,6 +128,8 @@ enum rtsp_read_request_response {
 
 rtsp_conn_info *principal_conn = NULL;
 rtsp_conn_info **conns = NULL;
+static pthread_mutex_t rtsp_listener_sockets_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int *rtsp_listener_sockets = NULL;
 
 // always lock this when accessing the principal conn value
 // use a read lock when consulting and holding it
@@ -253,6 +255,9 @@ int terminate_conn(int connection_number) {
   while ((i < nconns) && (found == 0)) {
     if ((conns[i] != NULL) && (conns[i]->connection_number == connection_number)) {
       pthread_cancel(conns[i]->thread);
+#ifdef CONFIG_FOR_MINGW
+      safe_socket_close(&conns[i]->fd);
+#endif
       pthread_join(conns[i]->thread, NULL);
       conns[i] = NULL;
       found = 1;
@@ -394,7 +399,12 @@ play_lock_r get_play_lock(rtsp_conn_info *conn, int allow_session_interruption) 
       debug(4, "Connection %d: about to be terminated.", principal_conn->connection_number);
       rtsp_conn_info *previous_principal_conn = principal_conn;
       principal_conn = conn; // make the conn the new principal_conn
+      int old_cancel_state;
+      pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
+      pthread_rwlock_unlock(&principal_conn_lock);
       terminate_conn(previous_principal_conn->connection_number);
+      pthread_rwlock_wrlock(&principal_conn_lock);
+      pthread_setcancelstate(old_cancel_state, NULL);
       debug(4, "Connection successfully terminated.");
       if (principal_conn == NULL) {
 #ifdef CONFIG_AIRPLAY_2
@@ -493,7 +503,7 @@ ssize_t read_encrypted(int fd, pair_cipher_bundle *ctx, void *buf, size_t count)
     pthread_cleanup_push(malloc_cleanup, &plain);
     size_t plain_len = 0;
     do {
-      response = read(fd, in, sizeof(in));
+      response = socket_read(fd, in, sizeof(in));
       if (response > 0) {
         buf_add(&ctx->encrypted_read_buffer, in, response);
         ssize_t consumed = pair_decrypt(&plain, &plain_len, ctx->encrypted_read_buffer.data,
@@ -533,7 +543,7 @@ ssize_t write_encrypted(int fd, pair_cipher_bundle *ctx, const void *buf, size_t
   // debug(1, "write encrypted:");
   // debug_print_buffer(1, encrypted, encrypted_len);
   while (remain > 0) {
-    ssize_t wrote = write(fd, encrypted + (encrypted_len - remain), remain);
+    ssize_t wrote = socket_write(fd, encrypted + (encrypted_len - remain), remain);
     if (wrote <= 0) {
       free(encrypted);
       return wrote;
@@ -559,10 +569,10 @@ ssize_t read_from_rtsp_connection(rtsp_conn_info *conn, void *buf, size_t count)
           read_encrypted(conn->fd, &conn->ap2_pairing_context.control_cipher_bundle, buf, count);
 
     } else {
-      result = read(conn->fd, buf, count);
+      result = socket_read(conn->fd, buf, count);
     }
 #else
-    result = read(conn->fd, buf, count);
+    result = socket_read(conn->fd, buf, count);
     // In AP1, the RTSP connection is closed in this way, so it's not unexpected
 #endif
     if ((result <= 0) && (errno != 0)) {
@@ -879,10 +889,10 @@ int msg_write_response(rtsp_conn_info *conn, rtsp_message *resp) {
     reply =
         write_encrypted(conn->fd, &conn->ap2_pairing_context.control_cipher_bundle, pkt, p - pkt);
   } else {
-    reply = write(conn->fd, pkt, p - pkt);
+    reply = socket_write(conn->fd, pkt, p - pkt);
   }
 #else
-  ssize_t reply = write(conn->fd, pkt, p - pkt);
+  ssize_t reply = socket_write(conn->fd, pkt, p - pkt);
 #endif
 
   if (reply == -1) {
@@ -4300,7 +4310,7 @@ static void *rtsp_conversation_thread_func(void *pconn) {
       } else if (reply == rtsp_read_request_response_bad_packet) {
         conn->stop = 0; // don't stop for a bad packet
         char *response_text = "RTSP/1.0 400 Bad Request\r\nServer: AirTunes/105.1\r\n\r\n";
-        ssize_t lreply = write(conn->fd, response_text, strlen(response_text));
+        ssize_t lreply = socket_write(conn->fd, response_text, strlen(response_text));
         if (lreply == -1) {
           char errorstring[1024];
           strerror_r(errno, (char *)errorstring, sizeof(errorstring));
@@ -4350,6 +4360,11 @@ void rtsp_listen_loop_cleanup_handler(__attribute__((unused)) void *arg) {
   }
   int *sockfd = (int *)arg;
   if (sockfd) {
+    pthread_mutex_lock(&rtsp_listener_sockets_mutex);
+    if (rtsp_listener_sockets == sockfd)
+      rtsp_listener_sockets = NULL;
+    pthread_mutex_unlock(&rtsp_listener_sockets_mutex);
+
     int i;
     for (i = 1; i <= sockfd[0]; i++) {
       safe_socket_close(&sockfd[i]);
@@ -4357,6 +4372,17 @@ void rtsp_listen_loop_cleanup_handler(__attribute__((unused)) void *arg) {
     free(sockfd);
   }
   pthread_setcancelstate(oldState, NULL);
+}
+
+void rtsp_request_listen_loop_exit(void) {
+  pthread_mutex_lock(&rtsp_listener_sockets_mutex);
+  int *sockfd = rtsp_listener_sockets;
+  if (sockfd) {
+    int i;
+    for (i = 1; i <= sockfd[0]; i++)
+      safe_socket_close(&sockfd[i]);
+  }
+  pthread_mutex_unlock(&rtsp_listener_sockets_mutex);
 }
 
 void *rtsp_listen_loop(__attribute((unused)) void *arg) {
@@ -4468,6 +4494,9 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
     mdns_register(t1, t2); // note that the dacp thread could still be using the mdns stuff after
                            // all player threads have been terminated, so mdns_unregister can't be
                            // in the rtsp_listen_loop cleanup.
+    pthread_mutex_lock(&rtsp_listener_sockets_mutex);
+    rtsp_listener_sockets = sockfd;
+    pthread_mutex_unlock(&rtsp_listener_sockets_mutex);
     pthread_setcancelstate(oldState, NULL);
     int acceptfd;
     struct timeval tv;
@@ -4526,7 +4555,7 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
       if (conn->fd < 0) {
         debug(1, "Connection %d: New connection on port %d not accepted:", conn->connection_number,
               config.port);
-        perror("failed to accept connection");
+        debug(1, "failed to accept connection: %s", strerror(errno));
 
 #ifndef CONFIG_AIRPLAY_2
         // in Classic AirPlay, close the connection unless idle or interruptions allowed...

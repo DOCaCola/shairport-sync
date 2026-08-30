@@ -209,6 +209,27 @@ uint8_t *create_label(const char *txt) {
   return s;
 }
 
+static uint8_t *create_txt(const char *txt) {
+  size_t len;
+  uint8_t *s;
+
+  if (txt == NULL)
+    return NULL;
+  len = strlen(txt);
+  if (len > UINT8_MAX)
+    die("can not create an oversized TXT item in tinysvcmdns.");
+
+  s = malloc(len + 2);
+  if (s) {
+    s[0] = (uint8_t)len;
+    memcpy((char *)s + 1, txt, len);
+    s[len + 1] = '\0';
+  } else {
+    die("can not allocate memory for \"s\" in tinysvcmdns.");
+  }
+  return s;
+}
+
 // creates a uncompressed name label given a DNS name like "apple.b.com"
 // free() after use
 uint8_t *create_nlabel(const char *name) {
@@ -467,7 +488,7 @@ struct rr_entry *rr_create_aaaa(uint8_t *name, struct in6_addr *addr) {
   DECL_MALLOC_ZERO_STRUCT(rr, rr_entry);
   if (rr) {
     FILL_RR_ENTRY(rr, name, RR_AAAA);
-    rr->data.AAAA.addr = addr;
+    rr->data.AAAA.addr = *addr;
     rr->ttl = DEFAULT_TTL_FOR_RECORD_WITH_HOSTNAME; // 120 seconds -- see RFC 6762 Section 10
   } else {
     die("could not allocate an RR 2 data structure in tinysvcmdns.c.");
@@ -524,7 +545,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
 
   // is current data filled?
   if (txt_rec->txt == NULL) {
-    txt_rec->txt = create_label(txt);
+    txt_rec->txt = create_txt(txt);
     return;
   }
 
@@ -536,7 +557,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
   txt_rec->next = malloc(sizeof(struct rr_data_txt));
 
   txt_rec = txt_rec->next;
-  txt_rec->txt = create_label(txt);
+  txt_rec->txt = create_txt(txt);
   txt_rec->next = NULL;
 }
 
@@ -711,8 +732,9 @@ err:
 }
 
 // parse the MDNS RR section
-// stores the parsed data in the given mdns_pkt struct
-static size_t mdns_parse_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struct mdns_pkt *pkt) {
+// stores the parsed data in the given RR list
+static size_t mdns_parse_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off,
+                            struct rr_list **rr_list) {
   const uint8_t *p = pkt_buf + off;
   const uint8_t *e = pkt_buf + pkt_len;
   struct rr_entry *rr;
@@ -721,7 +743,7 @@ static size_t mdns_parse_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struct
   struct rr_data_txt *txt_rec;
   int parse_error = 0;
 
-  assert(pkt != NULL);
+  assert(rr_list != NULL);
 
   if (off > pkt_len)
     return 0;
@@ -780,10 +802,9 @@ static size_t mdns_parse_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struct
       parse_error = 1;
       break;
     }
-    rr->data.AAAA.addr = malloc(sizeof(struct in6_addr));
     unsigned int i;
     for (i = 0; i < sizeof(struct in6_addr); i++)
-      rr->data.AAAA.addr->s6_addr[i] = p[i];
+      rr->data.AAAA.addr.s6_addr[i] = p[i];
     p += sizeof(struct in6_addr);
     break;
 
@@ -826,6 +847,27 @@ static size_t mdns_parse_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struct
     }
     break;
 
+  case RR_SRV:
+    if (rr_data_len < (3 * sizeof(uint16_t))) {
+      DEBUG_PRINTF("invalid rr_data_len=%lu for SRV record\n", rr_data_len);
+      parse_error = 1;
+      break;
+    }
+    rr->data.SRV.priority = mdns_read_u16(p);
+    p += sizeof(uint16_t);
+    rr->data.SRV.weight = mdns_read_u16(p);
+    p += sizeof(uint16_t);
+    rr->data.SRV.port = mdns_read_u16(p);
+    p += sizeof(uint16_t);
+    rr->data.SRV.target = uncompress_nlabel(pkt_buf, pkt_len, p - pkt_buf);
+    if (rr->data.SRV.target == NULL) {
+      DEBUG_PRINTF("unable to parse/uncompress label for SRV target\n");
+      parse_error = 1;
+      break;
+    }
+    p = e;
+    break;
+
   default:
     // skip to end of RR data
     p = e;
@@ -837,7 +879,7 @@ static size_t mdns_parse_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struct
     return 0;
   }
 
-  rr_list_append(&pkt->rr_ans, rr);
+  rr_list_append(rr_list, rr);
 
   return p - (pkt_buf + off);
 
@@ -891,7 +933,7 @@ struct mdns_pkt *mdns_parse_pkt(uint8_t *pkt_buf, size_t pkt_len) {
 
   // parse answer RRs
   for (i = 0; i < pkt->num_ans_rr; i++) {
-    size_t l = mdns_parse_rr(pkt_buf, pkt_len, off, pkt);
+    size_t l = mdns_parse_rr(pkt_buf, pkt_len, off, &pkt->rr_ans);
     if (!l) {
       DEBUG_PRINTF("error parsing answer #%d\n", i);
       mdns_pkt_destroy(pkt);
@@ -901,7 +943,27 @@ struct mdns_pkt *mdns_parse_pkt(uint8_t *pkt_buf, size_t pkt_len) {
     off += l;
   }
 
-  // TODO: parse the authority and additional RR sections
+  for (i = 0; i < pkt->num_auth_rr; i++) {
+    size_t l = mdns_parse_rr(pkt_buf, pkt_len, off, &pkt->rr_auth);
+    if (!l) {
+      DEBUG_PRINTF("error parsing authority record #%d\n", i);
+      mdns_pkt_destroy(pkt);
+      return NULL;
+    }
+
+    off += l;
+  }
+
+  for (i = 0; i < pkt->num_add_rr; i++) {
+    size_t l = mdns_parse_rr(pkt_buf, pkt_len, off, &pkt->rr_add);
+    if (!l) {
+      DEBUG_PRINTF("error parsing additional record #%d\n", i);
+      mdns_pkt_destroy(pkt);
+      return NULL;
+    }
+
+    off += l;
+  }
 
   return pkt;
 }
@@ -991,7 +1053,7 @@ static size_t mdns_encode_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struc
 
   case RR_AAAA:
     for (i = 0; i < sizeof(struct in6_addr); i++)
-      *p++ = rr->data.AAAA.addr->s6_addr[i];
+      *p++ = rr->data.AAAA.addr.s6_addr[i];
     break;
 
   case RR_PTR:
@@ -1155,14 +1217,20 @@ size_t mdns_encode_pkt(struct mdns_pkt *answer, uint8_t *pkt_buf, size_t pkt_len
 
 struct mdnsd {
   pthread_mutex_t data_lock;
+  pthread_mutex_t send_lock;
+  pthread_t thread;
   int sockfd;
   int notify_pipe[2];
   int stop_flag;
+  uint32_t *ipv4_interfaces;
+  size_t ipv4_interface_count;
 
   struct rr_group *group;
   struct rr_list *announce;
   struct rr_list *services;
   uint8_t *hostname;
+  mdnsd_packet_callback packet_callback;
+  void *packet_callback_userdata;
 };
 
 struct mdns_service {
@@ -1196,16 +1264,6 @@ static int create_recv_sock() {
     log_message(LOG_ERR, "recv bind(): %m");
   }
 
-  // add membership to receiving socket
-  struct ip_mreq mreq;
-  memset(&mreq, 0, sizeof(struct ip_mreq));
-  mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-  mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
-  if ((r = setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq))) < 0) {
-    log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %m");
-    return r;
-  }
-
   // enable loopback in case someone else needs the data
   if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, (char *)&on, sizeof(on))) < 0) {
     log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %m");
@@ -1222,7 +1280,7 @@ static int create_recv_sock() {
   return sd;
 }
 
-static ssize_t send_packet(int fd, const void *data, size_t len) {
+static ssize_t send_packet(struct mdnsd *s, const void *data, size_t len) {
   static struct sockaddr_in toaddr;
   if (toaddr.sin_family != AF_INET) {
     memset(&toaddr, 0, sizeof(struct sockaddr_in));
@@ -1231,7 +1289,62 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
     toaddr.sin_addr.s_addr = inet_addr(MDNS_ADDR);
   }
 
-  return sendto(fd, data, len, 0, (struct sockaddr *)&toaddr, sizeof(struct sockaddr_in));
+  ssize_t response = -1;
+  int saved_errno = ENETUNREACH;
+
+  pthread_mutex_lock(&s->send_lock);
+  for (size_t i = 0; i < s->ipv4_interface_count; i++) {
+    struct in_addr iface = {.s_addr = s->ipv4_interfaces[i]};
+    if (setsockopt(s->sockfd, IPPROTO_IP, IP_MULTICAST_IF, (char *)&iface, sizeof(iface)) < 0) {
+      saved_errno = socket_set_errno();
+      continue;
+    }
+
+    ssize_t sent = sendto(s->sockfd, data, len, 0, (struct sockaddr *)&toaddr,
+                          sizeof(struct sockaddr_in));
+    if (sent < 0)
+      saved_errno = socket_set_errno();
+    else
+      response = sent;
+  }
+  pthread_mutex_unlock(&s->send_lock);
+
+  if (response < 0)
+    errno = saved_errno;
+  return response;
+}
+
+int mdnsd_add_ipv4_interface(struct mdnsd *s, uint32_t interface_addr) {
+  pthread_mutex_lock(&s->send_lock);
+  for (size_t i = 0; i < s->ipv4_interface_count; i++) {
+    if (s->ipv4_interfaces[i] == interface_addr) {
+      pthread_mutex_unlock(&s->send_lock);
+      return 0;
+    }
+  }
+
+  struct ip_mreq mreq;
+  memset(&mreq, 0, sizeof(mreq));
+  mreq.imr_interface.s_addr = interface_addr;
+  mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
+  if (setsockopt(s->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq)) < 0) {
+    socket_set_errno();
+    pthread_mutex_unlock(&s->send_lock);
+    return -1;
+  }
+
+  uint32_t *interfaces =
+      realloc(s->ipv4_interfaces, (s->ipv4_interface_count + 1) * sizeof(*interfaces));
+  if (interfaces == NULL) {
+    errno = ENOMEM;
+    pthread_mutex_unlock(&s->send_lock);
+    return -1;
+  }
+
+  s->ipv4_interfaces = interfaces;
+  s->ipv4_interfaces[s->ipv4_interface_count++] = interface_addr;
+  pthread_mutex_unlock(&s->send_lock);
+  return 0;
 }
 
 // populate the specified list which matches the RR name and type
@@ -1413,7 +1526,7 @@ int create_pipe(int handles[2]) {
     return -1;
   }
   int len = sizeof(serv_addr);
-  if (getsockname(sock, (SOCKADDR *)&serv_addr, &len) == SOCKET_ERROR) {
+  if (getsockname(sock, (struct sockaddr *)&serv_addr, &len) == SOCKET_ERROR) {
     closesocket(sock);
     return -1;
   }
@@ -1506,9 +1619,18 @@ void *main_loop(struct mdnsd *svr) {
       DEBUG_PRINTF("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), (long)recvsize);
       struct mdns_pkt *mdns = mdns_parse_pkt(pkt_buffer, recvsize);
       if (mdns != NULL) {
+        mdnsd_packet_callback packet_callback = NULL;
+        void *packet_callback_userdata = NULL;
+        pthread_mutex_lock(&svr->data_lock);
+        packet_callback = svr->packet_callback;
+        packet_callback_userdata = svr->packet_callback_userdata;
+        pthread_mutex_unlock(&svr->data_lock);
+        if (packet_callback)
+          packet_callback(mdns, packet_callback_userdata);
+
         if (process_mdns_pkt(svr, mdns, mdns_reply)) {
           size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
-          send_packet(svr->sockfd, pkt_buffer, replylen);
+          send_packet(svr, pkt_buffer, replylen);
         } else if (mdns->num_qn == 0) {
           DEBUG_PRINTF("(no questions in packet)\n\n");
         }
@@ -1538,7 +1660,7 @@ void *main_loop(struct mdnsd *svr) {
 
       if (mdns_reply->num_ans_rr > 0) {
         size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
-        send_packet(svr->sockfd, pkt_buffer, replylen);
+        send_packet(svr, pkt_buffer, replylen);
       }
     }
   }
@@ -1558,7 +1680,7 @@ void *main_loop(struct mdnsd *svr) {
   // send out packet
   if (mdns_reply->num_ans_rr > 0) {
     size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
-    send_packet(svr->sockfd, pkt_buffer, replylen);
+    send_packet(svr, pkt_buffer, replylen);
   }
 
   // destroy packet
@@ -1619,6 +1741,42 @@ void mdnsd_add_rr(struct mdnsd *svr, struct rr_entry *rr) {
   pthread_mutex_lock(&svr->data_lock);
   rr_group_add(&svr->group, rr);
   pthread_mutex_unlock(&svr->data_lock);
+}
+
+void mdnsd_set_packet_callback(struct mdnsd *svr, mdnsd_packet_callback callback, void *userdata) {
+  pthread_mutex_lock(&svr->data_lock);
+  svr->packet_callback = callback;
+  svr->packet_callback_userdata = userdata;
+  pthread_mutex_unlock(&svr->data_lock);
+}
+
+int mdnsd_send_query(struct mdnsd *svr, const char *name, uint16_t type) {
+  uint8_t packet[PACKET_SIZE];
+  uint8_t *p = packet;
+  uint8_t *nlabel = create_nlabel(name);
+  if (nlabel == NULL)
+    return -1;
+
+  p = mdns_write_u16(p, 0);    // transaction ID
+  p = mdns_write_u16(p, 0);    // query flags
+  p = mdns_write_u16(p, 1);    // one question
+  p = mdns_write_u16(p, 0);    // no answers
+  p = mdns_write_u16(p, 0);    // no authority records
+  p = mdns_write_u16(p, 0);    // no additional records
+
+  size_t name_len = strlen((char *)nlabel) + 1;
+  if ((size_t)(p - packet) + name_len + (2 * sizeof(uint16_t)) > sizeof(packet)) {
+    free(nlabel);
+    return -1;
+  }
+
+  memcpy(p, nlabel, name_len);
+  p += name_len;
+  p = mdns_write_u16(p, type);
+  p = mdns_write_u16(p, 1); // class IN
+
+  free(nlabel);
+  return send_packet(svr, packet, p - packet) < 0 ? -1 : 0;
 }
 
 struct mdns_service *mdnsd_register_svc(struct mdnsd *svr, const char *instance_name,
@@ -1698,9 +1856,6 @@ void mdns_service_destroy(struct mdns_service *srv) {
 }
 
 struct mdnsd *mdnsd_start() {
-  pthread_t tid;
-  pthread_attr_t attr;
-
   struct mdnsd *server = malloc(sizeof(struct mdnsd));
   if (server)
     memset(server, 0, sizeof(struct mdnsd));
@@ -1721,13 +1876,11 @@ struct mdnsd *mdnsd_start() {
   }
 
   pthread_mutex_init(&server->data_lock, NULL);
+  pthread_mutex_init(&server->send_lock, NULL);
 
-  // init thread
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-  if (named_pthread_create(&tid, &attr, (void *(*)(void *)) & main_loop, (void *)server,
+  if (named_pthread_create(&server->thread, NULL, (void *(*)(void *)) & main_loop, (void *)server,
                            "tinysvcmdns") != 0) {
+    pthread_mutex_destroy(&server->send_lock);
     pthread_mutex_destroy(&server->data_lock);
     free(server);
     return NULL;
@@ -1739,20 +1892,14 @@ struct mdnsd *mdnsd_start() {
 void mdnsd_stop(struct mdnsd *s) {
   assert(s != NULL);
 
-  struct timeval tv = {
-      .tv_sec = 0,
-      .tv_usec = 500 * 1000,
-  };
-
   s->stop_flag = 1;
   write_pipe(s->notify_pipe[1], ".", 1);
-
-  while (s->stop_flag != 2)
-    select(0, NULL, NULL, NULL, &tv);
+  pthread_join(s->thread, NULL);
 
   close_pipe(&s->notify_pipe[0]);
   close_pipe(&s->notify_pipe[1]);
 
+  pthread_mutex_destroy(&s->send_lock);
   pthread_mutex_destroy(&s->data_lock);
   rr_group_destroy(s->group);
   rr_list_destroy(s->announce, 0);
@@ -1760,6 +1907,7 @@ void mdnsd_stop(struct mdnsd *s) {
 
   if (s->hostname)
     free(s->hostname);
+  free(s->ipv4_interfaces);
 
   free(s);
 }

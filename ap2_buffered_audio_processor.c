@@ -155,10 +155,12 @@ void *rtp_buffered_audio_processor(void *arg) {
   buffered_audio->eoq = buffered_audio->buffer;
 
   buffered_audio->sock_fd = conn->buffered_audio_socket;
+  buffered_audio->connection_fd = -1;
 
   named_pthread_create(buffered_reader_thread, NULL, &buffered_tcp_reader, buffered_audio,
                        "ap2_buf_rdr_%d", conn->connection_number);
   pthread_cleanup_push(thread_cleanup, buffered_reader_thread);
+  pthread_cleanup_push(buffered_tcp_desc_socket_cleanup, buffered_audio);
 
   const size_t buffer_packet_size = 16 * 1024; // it looks as if 4096 is the largest size (?)
   uint8_t *packet = malloc(buffer_packet_size);
@@ -218,6 +220,7 @@ void *rtp_buffered_audio_processor(void *arg) {
   reset_buffer(conn); // in case there is any garbage in the player
 
   do {
+    pthread_testcancel();
 
     if ((play_enabled == 0) && (conn->ap2_play_enabled != 0)) {
       // play newly started
@@ -689,10 +692,12 @@ void *rtp_buffered_audio_processor(void *arg) {
             }
             usleep(((1000000 * conn->frames_per_packet) / conn->input_rate) *
                    2); // wait for approximately the length of two packets
+            pthread_testcancel();
           }
         } else {
           debug(3, "just you wait, Henry Higgins, without valid timing information...");
           usleep(20000); // just you wait, Henry Higgins...        
+          pthread_testcancel();
         }
       }
     }
@@ -701,6 +706,7 @@ void *rtp_buffered_audio_processor(void *arg) {
   //       syscall(SYS_gettid));
   pthread_cleanup_pop(1); // m
   pthread_cleanup_pop(1); // packet
+  pthread_cleanup_pop(1); // buffered audio sockets
   pthread_cleanup_pop(1); // buffered_tcp_reader thread creation
   pthread_cleanup_pop(1); // buffer malloc
   pthread_cleanup_pop(1); // not_full_cv

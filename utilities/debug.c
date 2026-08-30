@@ -22,6 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+#include "config.h"
 #include "debug.h"
 #include <ctype.h> // for isprint()
 #include <inttypes.h>
@@ -33,6 +34,12 @@ SOFTWARE.
 #include <string.h>
 #include <syslog.h>
 
+#ifdef CONFIG_FOR_MINGW
+#include <io.h>
+#include <process.h>
+#include <windows.h>
+#endif
+
 static int debuglev = 0;
 int debugger_show_elapsed_time = 0;
 int debugger_show_relative_time = 0;
@@ -43,6 +50,152 @@ static uint64_t ns_time_at_last_debug_message;
 
 // always lock use this when accessing the ns_time_at_last_debug_message
 static pthread_mutex_t debug_timing_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef CONFIG_FOR_MINGW
+#define ASYNC_CONSOLE_QUEUE_CAPACITY 256
+#define ASYNC_CONSOLE_MESSAGE_SIZE 4096
+
+typedef struct {
+  FILE *stream;
+  char message[ASYNC_CONSOLE_MESSAGE_SIZE];
+} async_console_message;
+
+static INIT_ONCE async_console_init_once = INIT_ONCE_STATIC_INIT;
+static SRWLOCK async_console_queue_lock = SRWLOCK_INIT;
+static HANDLE async_console_queue_event = NULL;
+static volatile LONG async_console_messages_dropped = 0;
+static int async_console_writer_available = 0;
+static int async_console_stderr_enabled = 0;
+static int async_console_stdout_enabled = 0;
+static async_console_message async_console_queue[ASYNC_CONSOLE_QUEUE_CAPACITY];
+static size_t async_console_queue_head = 0;
+static size_t async_console_queue_tail = 0;
+static size_t async_console_queue_count = 0;
+
+static int stream_has_windows_console(FILE *stream) {
+  int fd = _fileno(stream);
+  if (fd < 0)
+    return 0;
+
+  intptr_t os_handle = _get_osfhandle(fd);
+  if (os_handle == (intptr_t)-1)
+    return 0;
+
+  DWORD mode;
+  return GetConsoleMode((HANDLE)os_handle, &mode) != 0;
+}
+
+static unsigned __stdcall async_console_writer(void *arg) {
+  (void)arg;
+  async_console_message message;
+
+  while (WaitForSingleObject(async_console_queue_event, INFINITE) == WAIT_OBJECT_0) {
+    while (1) {
+      AcquireSRWLockExclusive(&async_console_queue_lock);
+      if (async_console_queue_count == 0) {
+        ReleaseSRWLockExclusive(&async_console_queue_lock);
+        break;
+      }
+
+      message = async_console_queue[async_console_queue_head];
+      async_console_queue_head =
+          (async_console_queue_head + 1) % ASYNC_CONSOLE_QUEUE_CAPACITY;
+      async_console_queue_count--;
+      ReleaseSRWLockExclusive(&async_console_queue_lock);
+
+      LONG dropped = InterlockedExchange(&async_console_messages_dropped, 0);
+      if (dropped != 0)
+        fprintf(message.stream, "[shairport-sync] %ld console messages dropped.\n", dropped);
+      fprintf(message.stream, "%s\n", message.message);
+    }
+  }
+
+  return 0;
+}
+
+static BOOL CALLBACK async_console_init(PINIT_ONCE init_once, PVOID parameter, PVOID *context) {
+  (void)init_once;
+  (void)parameter;
+  (void)context;
+
+  async_console_stderr_enabled = stream_has_windows_console(stderr);
+  async_console_stdout_enabled = stream_has_windows_console(stdout);
+  if (async_console_stderr_enabled == 0 && async_console_stdout_enabled == 0)
+    return TRUE;
+
+  async_console_queue_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+  if (async_console_queue_event != NULL) {
+    uintptr_t thread = _beginthreadex(NULL, 0, async_console_writer, NULL, 0, NULL);
+    if (thread != 0) {
+      CloseHandle((HANDLE)thread);
+      async_console_writer_available = 1;
+    } else {
+      CloseHandle(async_console_queue_event);
+      async_console_queue_event = NULL;
+    }
+  }
+
+  return TRUE;
+}
+
+static void async_console_output_init(void) {
+  InitOnceExecuteOnce(&async_console_init_once, async_console_init, NULL, NULL);
+}
+
+static void async_console_enqueue(FILE *stream, const char *message) {
+  if (async_console_writer_available == 0 ||
+      TryAcquireSRWLockExclusive(&async_console_queue_lock) == 0) {
+    InterlockedIncrement(&async_console_messages_dropped);
+    return;
+  }
+
+  if (async_console_queue_count == ASYNC_CONSOLE_QUEUE_CAPACITY) {
+    ReleaseSRWLockExclusive(&async_console_queue_lock);
+    InterlockedIncrement(&async_console_messages_dropped);
+    return;
+  }
+
+  async_console_message *entry = &async_console_queue[async_console_queue_tail];
+  entry->stream = stream;
+  size_t message_length = strlen(message);
+  if (message_length < sizeof(entry->message)) {
+    memcpy(entry->message, message, message_length + 1);
+  } else {
+    static const char truncation_marker[] = "... [truncated]";
+    size_t marker_length = sizeof(truncation_marker) - 1;
+    size_t copy_length = sizeof(entry->message) - marker_length - 1;
+    memcpy(entry->message, message, copy_length);
+    memcpy(entry->message + copy_length, truncation_marker, marker_length + 1);
+  }
+
+  async_console_queue_tail =
+      (async_console_queue_tail + 1) % ASYNC_CONSOLE_QUEUE_CAPACITY;
+  async_console_queue_count++;
+  ReleaseSRWLockExclusive(&async_console_queue_lock);
+  SetEvent(async_console_queue_event);
+}
+#endif
+
+void debug_write_line(FILE *stream, const char *message) {
+#ifdef CONFIG_FOR_MINGW
+  async_console_output_init();
+  if ((stream == stderr && async_console_stderr_enabled != 0) ||
+      (stream == stdout && async_console_stdout_enabled != 0)) {
+    async_console_enqueue(stream, message);
+    return;
+  }
+#endif
+  fprintf(stream, "%s\n", message);
+}
+
+void debug_write_formatted_line(FILE *stream, const char *format, ...) {
+  char message[1024 * 64];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+  debug_write_line(stream, message);
+}
 
 uint64_t debug_get_absolute_time_in_ns() {
   uint64_t time_now_ns;
@@ -57,6 +210,9 @@ uint64_t debug_get_absolute_time_in_ns() {
 }
 
 void debug_init(int level, int show_elapsed_time, int show_relative_time, int show_file_and_line) {
+#ifdef CONFIG_FOR_MINGW
+  async_console_output_init();
+#endif
   ns_time_at_startup = debug_get_absolute_time_in_ns();
   ns_time_at_last_debug_message = ns_time_at_startup;
   debuglev = level;
@@ -171,7 +327,7 @@ void _warn(const char *filename, const int linenumber, const char *format, ...) 
   vsnprintf(s, sizeof(b) - (s - b), format, args);
   va_end(args);
   // syslog(LOG_WARNING, "%s", b);
-  fprintf(stderr, "%s\n", b);
+  debug_write_line(stderr, b);
   pthread_setcancelstate(oldState, NULL);
 }
 
@@ -196,7 +352,7 @@ void _debug(const char *filename, const int linenumber, int level, const char *f
   vsnprintf(s, sizeof(b) - (s - b), format, args);
   va_end(args);
   // syslog(LOG_DEBUG, "%s", b);
-  fprintf(stderr, "%s\n", b);
+  debug_write_line(stderr, b);
   pthread_setcancelstate(oldState, NULL);
 }
 
@@ -224,7 +380,7 @@ void _inform(const char *filename, const int linenumber, const char *format, ...
   vsnprintf(s, sizeof(b) - (s - b), format, args);
   va_end(args);
   // syslog(LOG_INFO, "%s", b);
-  fprintf(stderr, "%s\n", b);
+  debug_write_line(stderr, b);
   pthread_setcancelstate(oldState, NULL);
 }
 

@@ -26,6 +26,7 @@ SOFTWARE.
 #define __DEBUG_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 #define EXTERNC extern "C"
@@ -56,6 +57,10 @@ EXTERNC void set_show_file_and_line(int setting);
 #else
 #define PRINTF_LIKE(fmt, args)
 #endif
+
+EXTERNC void debug_write_line(FILE *stream, const char *message);
+EXTERNC void debug_write_formatted_line(FILE *stream, const char *format, ...)
+    PRINTF_LIKE(2, 3);
 
 // Function declarations with printf-style format checking
 EXTERNC void _die(const char *filename, const int linenumber, const char *format, ...)

@@ -29,6 +29,57 @@
 #include <errno.h>
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>
+
+#ifdef CONFIG_FOR_MINGW
+#include <winsock2.h>
+#endif
+
+int socket_set_errno(void) {
+#ifdef CONFIG_FOR_MINGW
+  switch (WSAGetLastError()) {
+  case WSAEINTR:
+    errno = EINTR;
+    break;
+  case WSAEWOULDBLOCK:
+    errno = EAGAIN;
+    break;
+  case WSAEADDRINUSE:
+    errno = EADDRINUSE;
+    break;
+  case WSAECONNRESET:
+    errno = ECONNRESET;
+    break;
+  case WSAETIMEDOUT:
+    errno = ETIMEDOUT;
+    break;
+  case WSAECONNREFUSED:
+    errno = ECONNREFUSED;
+    break;
+  default:
+    errno = EIO;
+    break;
+  }
+#endif
+  return errno;
+}
+
+int socket_set_timeout_ms(int sockfd, int option_name, uint32_t timeout_ms) {
+#ifdef CONFIG_FOR_MINGW
+  DWORD timeout = timeout_ms;
+  int response =
+      setsockopt(sockfd, SOL_SOCKET, option_name, (const char *)&timeout, sizeof(timeout));
+#else
+  struct timeval timeout = {
+      .tv_sec = timeout_ms / 1000,
+      .tv_usec = (timeout_ms % 1000) * 1000,
+  };
+  int response = setsockopt(sockfd, SOL_SOCKET, option_name, &timeout, sizeof(timeout));
+#endif
+  if (response < 0)
+    socket_set_errno();
+  return response;
+}
 
 int eintr_checked_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   int response;
@@ -36,6 +87,7 @@ int eintr_checked_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) 
     response = accept(sockfd, addr, addrlen);
 
     if (response == -1) {
+      socket_set_errno();
       char errorstring[1024];
       strerror_r(errno, (char *)errorstring, sizeof(errorstring));
       debug(1, "error %d accept()ing a socket %d: \"%s\". (Note: error %d will be ignored.)", errno,
@@ -48,6 +100,28 @@ int eintr_checked_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) 
 
 pthread_mutex_t safe_socket_lock = PTHREAD_MUTEX_INITIALIZER;
 
+ssize_t socket_read(int sockfd, void *buf, size_t count) {
+#ifdef CONFIG_FOR_MINGW
+  int response = recv(sockfd, buf, count, 0);
+  if (response == SOCKET_ERROR)
+    socket_set_errno();
+  return response;
+#else
+  return read(sockfd, buf, count);
+#endif
+}
+
+ssize_t socket_write(int sockfd, const void *buf, size_t count) {
+#ifdef CONFIG_FOR_MINGW
+  int response = send(sockfd, buf, count, 0);
+  if (response == SOCKET_ERROR)
+    socket_set_errno();
+  return response;
+#else
+  return write(sockfd, buf, count);
+#endif
+}
+
 int _safe_socket_close(const char *filename, const int linenumber, int *sockfd) {
   int result = 0;
   int oldstate;
@@ -58,7 +132,11 @@ int _safe_socket_close(const char *filename, const int linenumber, int *sockfd) 
   }
   if ((*sockfd != -1) && (*sockfd != 0)) {
     _debug(filename, linenumber, 4, "_safe_socket_close: closing socket %d.", *sockfd);
+#ifdef CONFIG_FOR_MINGW
+    result = closesocket(*sockfd);
+#else
     result = close(*sockfd);
+#endif
     if (result == 0)
       *sockfd = -1;
   } else {

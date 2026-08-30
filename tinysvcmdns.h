@@ -40,7 +40,11 @@
 #include <string.h>
 
 #ifdef _WIN32
-#include <winsock.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #endif
@@ -82,7 +86,7 @@ struct rr_data_a {
 };
 
 struct rr_data_aaaa {
-  struct in6_addr *addr;
+  struct in6_addr addr;
 };
 
 struct rr_entry {
@@ -205,10 +209,13 @@ static inline int cmp_nlabel(const uint8_t *L1, const uint8_t *L2) {
 
 struct mdnsd;
 struct mdns_service;
+typedef void (*mdnsd_packet_callback)(struct mdns_pkt *pkt, void *userdata);
 
 // starts a MDNS responder instance
 // returns NULL if unsuccessful
 struct mdnsd *mdnsd_start();
+
+int mdnsd_add_ipv4_interface(struct mdnsd *s, uint32_t interface_addr);
 
 // stops the given MDNS responder instance
 void mdnsd_stop(struct mdnsd *s);
@@ -221,6 +228,11 @@ void mdnsd_set_hostname_v6(struct mdnsd *svr, const char *hostname, struct in6_a
 
 // adds an additional RR
 void mdnsd_add_rr(struct mdnsd *svr, struct rr_entry *rr);
+
+void mdnsd_set_packet_callback(struct mdnsd *svr, mdnsd_packet_callback callback,
+                               void *userdata);
+
+int mdnsd_send_query(struct mdnsd *svr, const char *name, uint16_t type);
 
 // registers a service with the MDNS responder instance
 struct mdns_service *mdnsd_register_svc(struct mdnsd *svr, const char *instance_name,

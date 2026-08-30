@@ -27,9 +27,16 @@
 
 #include "mdns.h"
 #include "common.h"
+#ifdef CONFIG_DACP_CLIENT
+#include "dacp.h"
+#endif
+#ifdef CONFIG_METADATA
+#include "metadata/core.h"
+#endif
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -37,19 +44,126 @@
 
 #include "tinysvcmdns.h"
 
-static struct mdnsd *svr = NULL;
+struct mdns_tinysvcmdns_server {
+  struct mdnsd *server;
+  char *interface_name;
+  struct mdns_tinysvcmdns_server *next;
+};
 
-static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char *ap2name, int port,
-                                     __attribute__((unused)) char **txt_records,
-                                     __attribute__((unused)) char **secondary_txt_records) {
+static struct mdns_tinysvcmdns_server *servers = NULL;
+
+static struct mdns_tinysvcmdns_server *find_server_for_interface(const char *interface_name) {
+  struct mdns_tinysvcmdns_server *server = servers;
+  while (server != NULL) {
+    if (strcmp(server->interface_name, interface_name) == 0)
+      return server;
+    server = server->next;
+  }
+  return NULL;
+}
+
+#ifdef CONFIG_DACP_CLIENT
+static pthread_mutex_t dacp_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *dacp_monitor_id = NULL;
+
+static char *nlabel_to_str_no_trailing_dot(const uint8_t *name) {
+  char *name_string = nlabel_to_str(name);
+  if (name_string != NULL) {
+    size_t len = strlen(name_string);
+    if ((len > 0) && (name_string[len - 1] == '.'))
+      name_string[len - 1] = '\0';
+  }
+  return name_string;
+}
+
+static int service_name_matches_dacp_id(const char *service_name, const char *dacp_id) {
+  const char prefix[] = "iTunes_Ctrl_";
+  const char suffix[] = "._dacp._tcp.local";
+  size_t service_name_len = strlen(service_name);
+  size_t prefix_len = strlen(prefix);
+  size_t suffix_len = strlen(suffix);
+
+  if ((dacp_id == NULL) || (service_name_len <= prefix_len + suffix_len) ||
+      (strncmp(service_name, prefix, prefix_len) != 0) ||
+      (strcmp(service_name + service_name_len - suffix_len, suffix) != 0))
+    return 0;
+
+  const char *service_dacp_id = service_name + prefix_len;
+  size_t service_dacp_id_len = service_name_len - prefix_len - suffix_len;
+  while ((service_dacp_id_len > 0) && (*service_dacp_id == '0')) {
+    service_dacp_id++;
+    service_dacp_id_len--;
+  }
+
+  return (strlen(dacp_id) == service_dacp_id_len) &&
+         (strncmp(service_dacp_id, dacp_id, service_dacp_id_len) == 0);
+}
+
+static void mdns_tinysvcmdns_note_dacp_port(const char *dacp_id, uint16_t port) {
+  dacp_monitor_port_update_callback(dacp_id, port);
+#ifdef CONFIG_METADATA
+  char port_in_chars[16];
+  snprintf(port_in_chars, sizeof(port_in_chars), "%u", port);
+  send_ssnc_metadata('dapo', port_in_chars, strlen(port_in_chars), 0);
+#endif
+}
+
+static void process_dacp_record(struct rr_entry *rr, const char *dacp_id, struct mdnsd *server) {
+  if (rr == NULL)
+    return;
+
+  if (rr->type == RR_PTR) {
+    char *name = nlabel_to_str_no_trailing_dot(rr->name);
+    if ((name != NULL) && (strcmp(name, "_dacp._tcp.local") == 0)) {
+      char *service_name = nlabel_to_str_no_trailing_dot(MDNS_RR_GET_PTR_NAME(rr));
+      if ((service_name != NULL) && service_name_matches_dacp_id(service_name, dacp_id)) {
+        if (rr->ttl == 0) {
+          mdns_tinysvcmdns_note_dacp_port(dacp_id, 0);
+        } else if (server != NULL) {
+          mdnsd_send_query(server, service_name, RR_SRV);
+        }
+      }
+      free(service_name);
+    }
+    free(name);
+  } else if (rr->type == RR_SRV) {
+    char *service_name = nlabel_to_str_no_trailing_dot(rr->name);
+    if ((service_name != NULL) && service_name_matches_dacp_id(service_name, dacp_id)) {
+      mdns_tinysvcmdns_note_dacp_port(dacp_id, rr->ttl == 0 ? 0 : rr->data.SRV.port);
+    }
+    free(service_name);
+  }
+}
+
+static void process_dacp_record_list(struct rr_list *records, const char *dacp_id,
+                                     struct mdnsd *server) {
+  for (; records != NULL; records = records->next)
+    process_dacp_record(records->e, dacp_id, server);
+}
+
+static void mdns_tinysvcmdns_packet_callback(struct mdns_pkt *pkt, void *userdata) {
+  struct mdnsd *server = userdata;
+  char *dacp_id = NULL;
+  pthread_mutex_lock(&dacp_monitor_lock);
+  if (dacp_monitor_id != NULL)
+    dacp_id = strdup(dacp_monitor_id);
+  pthread_mutex_unlock(&dacp_monitor_lock);
+
+  if (dacp_id == NULL)
+    return;
+
+  process_dacp_record_list(pkt->rr_ans, dacp_id, server);
+  process_dacp_record_list(pkt->rr_auth, dacp_id, server);
+  process_dacp_record_list(pkt->rr_add, dacp_id, server);
+
+  free(dacp_id);
+}
+#endif
+
+static int mdns_tinysvcmdns_register(char *ap1name, char *ap2name, int port, char **txt_records,
+                                     char **secondary_txt_records) {
   struct ifaddrs *ifalist;
   struct ifaddrs *ifa;
-
-  svr = mdnsd_start();
-  if (svr == NULL) {
-    warn("tinysvcmdns: mdnsd_start() failed");
-    return -1;
-  }
 
   // Thanks to Paul Lietar for this
   // room for name + .local + NULL
@@ -69,72 +183,82 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
     return -1;
   }
 
-  ifa = ifalist;
-
-  // Look for an ipv4/ipv6 non-loopback interface to use as the main one.
+  // Use a separate responder for every interface so that host address records stay interface
+  // scoped, as they are with Avahi.
   for (ifa = ifalist; ifa != NULL; ifa = ifa->ifa_next) {
-    // only check for the named interface, if specified
-    if ((config.interface == NULL) || (strcmp(config.interface, ifa->ifa_name) == 0)) {
+    if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK) || (ifa->ifa_addr == NULL) ||
+        (ifa->ifa_addr->sa_family != AF_INET))
+      continue;
+    if ((config.interface != NULL) && (strcmp(config.interface, ifa->ifa_name) != 0))
+      continue;
 
-      if (!(ifa->ifa_flags & IFF_LOOPBACK) && ifa->ifa_addr &&
-          ifa->ifa_addr->sa_family == AF_INET) {
-        uint32_t main_ip = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
-
-        mdnsd_set_hostname(svr, hostname, main_ip); // TTL should be 120 seconds
-        break;
-      } else if (!(ifa->ifa_flags & IFF_LOOPBACK) && ifa->ifa_addr &&
-                 ifa->ifa_addr->sa_family == AF_INET6) {
-        struct in6_addr *addr = &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
-
-        mdnsd_set_hostname_v6(svr, hostname, addr); // TTL should be 120 seconds
-        break;
-      }
+    uint32_t interface_ip = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
+    struct mdns_tinysvcmdns_server *server = find_server_for_interface(ifa->ifa_name);
+    if (server != NULL) {
+      struct rr_entry *a_e =
+          rr_create_a(create_nlabel(hostname), interface_ip); // TTL should be 120 seconds
+      mdnsd_add_rr(server->server, a_e);
+      continue;
     }
+
+    struct mdnsd *mdns_server = mdnsd_start();
+    if (mdns_server == NULL) {
+      warn("tinysvcmdns: mdnsd_start() failed for interface \"%s\"", ifa->ifa_name);
+      continue;
+    }
+
+    if (mdnsd_add_ipv4_interface(mdns_server, interface_ip) != 0) {
+      char errorstring[1024];
+      getErrorText(errorstring, sizeof(errorstring));
+      warn("tinysvcmdns: could not join the mDNS group on interface \"%s\": %s",
+           ifa->ifa_name, errorstring);
+      mdnsd_stop(mdns_server);
+      continue;
+    }
+
+    server = calloc(1, sizeof(*server));
+    if (server == NULL) {
+      mdnsd_stop(mdns_server);
+      freeifaddrs(ifalist);
+      return -1;
+    }
+    server->interface_name = strdup(ifa->ifa_name);
+    if (server->interface_name == NULL) {
+      free(server);
+      mdnsd_stop(mdns_server);
+      freeifaddrs(ifalist);
+      return -1;
+    }
+    server->server = mdns_server;
+    server->next = servers;
+    servers = server;
+
+    mdnsd_set_hostname(mdns_server, hostname, interface_ip); // TTL should be 120 seconds
   }
 
-  if (ifa == NULL) {
-    warn("tinysvcmdns: no non-loopback ipv4 or ipv6 interface found");
+  if (servers == NULL) {
+    warn("tinysvcmdns: no active non-loopback IPv4 interface found");
+    freeifaddrs(ifalist);
     return -1;
   }
 
-  // Skip the first one, it was already added by set_hostname
-  for (ifa = ifa->ifa_next; ifa != NULL; ifa = ifa->ifa_next) {
-    if (ifa->ifa_flags & IFF_LOOPBACK) // Skip loop-back interfaces
+  for (ifa = ifalist; ifa != NULL; ifa = ifa->ifa_next) {
+    if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK) || (ifa->ifa_addr == NULL) ||
+        (ifa->ifa_addr->sa_family != AF_INET6))
       continue;
-    // only check for the named interface, if specified
-    if ((config.interface == NULL) || (strcmp(config.interface, ifa->ifa_name) == 0)) {
-      switch (ifa->ifa_addr->sa_family) {
-      case AF_INET: { // ipv4
-        uint32_t ip = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
-        struct rr_entry *a_e =
-            rr_create_a(create_nlabel(hostname), ip); // TTL should be 120 seconds
-        mdnsd_add_rr(svr, a_e);
-      } break;
-      case AF_INET6: { // ipv6
-        struct in6_addr *addr = &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
-        struct rr_entry *aaaa_e =
-            rr_create_aaaa(create_nlabel(hostname), addr); // TTL should be 120 seconds
-        mdnsd_add_rr(svr, aaaa_e);
-      } break;
-      }
+    if ((config.interface != NULL) && (strcmp(config.interface, ifa->ifa_name) != 0))
+      continue;
+
+    struct mdns_tinysvcmdns_server *server = find_server_for_interface(ifa->ifa_name);
+    if (server != NULL) {
+      struct in6_addr *addr = &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+      struct rr_entry *aaaa_e =
+          rr_create_aaaa(create_nlabel(hostname), addr); // TTL should be 120 seconds
+      mdnsd_add_rr(server->server, aaaa_e);
     }
   }
 
-  freeifaddrs(ifa);
-
-  char *txtwithoutmetadata[] = {MDNS_RECORD_WITHOUT_METADATA, NULL};
-#ifdef CONFIG_METADATA
-  char *txtwithmetadata[] = {MDNS_RECORD_WITH_METADATA, NULL};
-#endif
-  char **txt;
-
-#ifdef CONFIG_METADATA
-  if (config.metadata_enabled)
-    txt = txtwithmetadata;
-  else
-#endif
-
-    txt = txtwithoutmetadata;
+  freeifaddrs(ifalist);
 
   if (config.regtype == NULL)
     die("tinysvcmdns: regtype is null");
@@ -147,26 +271,102 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
   strcpy(extendedregtype, config.regtype);
   strcat(extendedregtype, ".local");
 
-  struct mdns_service *svc =
-      mdnsd_register_svc(svr, ap1name, extendedregtype, port, NULL,
-                         (const char **)txt); // TTL should be 75 minutes, i.e. 4500 seconds
-  mdns_service_destroy(svc);
+  char *secondary_extendedregtype = NULL;
+  if ((ap2name != NULL) && (secondary_txt_records != NULL)) {
+    if (config.regtype2 == NULL)
+      die("tinysvcmdns: regtype2 is null");
 
+    secondary_extendedregtype = malloc(strlen(config.regtype2) + strlen(".local") + 1);
+
+    if (secondary_extendedregtype == NULL)
+      die("tinysvcmdns: could not allocated memory to request a secondary Zeroconf service");
+
+    strcpy(secondary_extendedregtype, config.regtype2);
+    strcat(secondary_extendedregtype, ".local");
+  }
+
+  struct mdns_tinysvcmdns_server *server = servers;
+  while (server != NULL) {
+    struct mdns_service *svc = mdnsd_register_svc(
+        server->server, ap1name, extendedregtype, port, NULL,
+        (const char **)txt_records); // TTL should be 75 minutes, i.e. 4500 seconds
+    mdns_service_destroy(svc);
+
+    if (secondary_extendedregtype != NULL) {
+      svc = mdnsd_register_svc(server->server, ap2name, secondary_extendedregtype, port, NULL,
+                              (const char **)secondary_txt_records);
+      mdns_service_destroy(svc);
+    }
+    server = server->next;
+  }
+
+  free(secondary_extendedregtype);
   free(extendedregtype);
 
   return 0;
 }
 
 static void mdns_tinysvcmdns_unregister(void) {
-  if (svr) {
-    mdnsd_stop(svr);
-    svr = NULL;
+  while (servers != NULL) {
+    struct mdns_tinysvcmdns_server *server = servers;
+    servers = server->next;
+    mdnsd_set_packet_callback(server->server, NULL, NULL);
+    mdnsd_stop(server->server);
+    free(server->interface_name);
+    free(server);
   }
 }
+
+#ifdef CONFIG_DACP_CLIENT
+static void mdns_tinysvcmdns_dacp_monitor_start(void) {
+  struct mdns_tinysvcmdns_server *server = servers;
+  while (server != NULL) {
+    mdnsd_set_packet_callback(server->server, mdns_tinysvcmdns_packet_callback, server->server);
+    server = server->next;
+  }
+}
+
+static void mdns_tinysvcmdns_dacp_monitor_set_id(const char *dacp_id) {
+  pthread_mutex_lock(&dacp_monitor_lock);
+  free(dacp_monitor_id);
+  dacp_monitor_id = dacp_id == NULL ? NULL : strdup(dacp_id);
+  pthread_mutex_unlock(&dacp_monitor_lock);
+
+  if ((dacp_id != NULL) && (strlen(dacp_id) > 0)) {
+    struct mdns_tinysvcmdns_server *server = servers;
+    while (server != NULL) {
+      mdnsd_send_query(server->server, "_dacp._tcp.local", RR_PTR);
+      server = server->next;
+    }
+  }
+}
+
+static void mdns_tinysvcmdns_dacp_monitor_stop(void) {
+  struct mdns_tinysvcmdns_server *server = servers;
+  while (server != NULL) {
+    mdnsd_set_packet_callback(server->server, NULL, NULL);
+    server = server->next;
+  }
+
+  pthread_mutex_lock(&dacp_monitor_lock);
+  free(dacp_monitor_id);
+  dacp_monitor_id = NULL;
+  pthread_mutex_unlock(&dacp_monitor_lock);
+}
+#endif
 
 mdns_backend mdns_tinysvcmdns = {.name = "tinysvcmdns",
                                  .mdns_register = mdns_tinysvcmdns_register,
                                  .mdns_unregister = mdns_tinysvcmdns_unregister,
+#ifdef CONFIG_DACP_CLIENT
+                                 .mdns_dacp_monitor_start =
+                                     mdns_tinysvcmdns_dacp_monitor_start,
+                                 .mdns_dacp_monitor_set_id =
+                                     mdns_tinysvcmdns_dacp_monitor_set_id,
+                                 .mdns_dacp_monitor_stop =
+                                     mdns_tinysvcmdns_dacp_monitor_stop};
+#else
                                  .mdns_dacp_monitor_start = NULL,
                                  .mdns_dacp_monitor_set_id = NULL,
                                  .mdns_dacp_monitor_stop = NULL};
+#endif

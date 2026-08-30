@@ -48,7 +48,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef CONFIG_FOR_MINGW
 #include <sys/wait.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -250,7 +252,7 @@ void do_sps_log_to_stderr(__attribute__((unused)) int prio, const char *t, ...) 
   va_start(args, t);
   vsnprintf(s, sizeof(s), t, args);
   va_end(args);
-  fprintf(stderr, "%s\n", s);
+  debug_write_line(stderr, s);
 }
 
 void do_sps_log_to_stdout(__attribute__((unused)) int prio, const char *t, ...) {
@@ -259,7 +261,7 @@ void do_sps_log_to_stdout(__attribute__((unused)) int prio, const char *t, ...) 
   va_start(args, t);
   vsnprintf(s, sizeof(s), t, args);
   va_end(args);
-  fprintf(stdout, "%s\n", s);
+  debug_write_line(stdout, s);
 }
 
 int create_log_file(const char *path) {
@@ -324,7 +326,7 @@ void do_sps_log_to_fd(__attribute__((unused)) int prio, const char *t, ...) {
   if (config.log_fd >= 0) {
     dprintf(config.log_fd, "%s\n", s);
   } else if (errno != ENXIO) { // maybe there is a pipe there but not hooked up
-    fprintf(stderr, "%s\n", s);
+    debug_write_line(stderr, s);
   }
 }
 
@@ -341,7 +343,9 @@ void log_to_syslog() {
 
 shairport_cfg config;
 
+#ifndef CONFIG_FOR_MINGW
 sigset_t pselect_sigset;
+#endif
 
 // note -- don't use this to shutdown from dbus -- see its own code in dbus-service.c
 void sps_shutdown(type_of_exit_type shutdown_type) { // TOE_normal, TOE_emergency
@@ -389,7 +393,7 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
   int ret = 0; // no error
   int local_socket = socket(ip_family, type, 0);
   if (local_socket == -1)
-    ret = errno;
+    ret = socket_set_errno();
   if (ret == 0) {
     SOCKADDR myaddr;
     memset(&myaddr, 0, sizeof(myaddr));
@@ -411,7 +415,7 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
     }
 #endif
     if (ret < 0) {
-      ret = errno;
+      ret = socket_set_errno();
       safe_socket_close(&local_socket);
       char errorstring[1024];
       getErrorText((char *)errorstring, sizeof(errorstring));
@@ -422,7 +426,7 @@ int bind_socket_and_port(int type, int ip_family, const char *self_ip_address, u
       socklen_t local_len = sizeof(local);
       ret = getsockname(local_socket, (struct sockaddr *)&local, &local_len);
       if (ret < 0) {
-        ret = errno;
+        ret = socket_set_errno();
         safe_socket_close(&local_socket);
         char errorstring[1024];
         getErrorText((char *)errorstring, sizeof(errorstring));
@@ -451,8 +455,10 @@ uint16_t bind_UDP_port(int ip_family, const char *self_ip_address, uint32_t scop
   int ret = 0;
 
   int local_socket = socket(ip_family, SOCK_DGRAM, IPPROTO_UDP);
-  if (local_socket == -1)
+  if (local_socket == -1) {
+    socket_set_errno();
     die("Could not allocate a socket.");
+  }
 
   /*
     int val = 1;
@@ -488,6 +494,9 @@ uint16_t bind_UDP_port(int ip_family, const char *self_ip_address, uint32_t scop
       ret = bind(local_socket, (struct sockaddr *)sa6, sizeof(struct sockaddr_in6));
     }
 #endif
+
+    if (ret < 0)
+      socket_set_errno();
 
   } while ((ret < 0) && (errno == EADDRINUSE) && (desired_port != 0) &&
            (tryCount < config.udp_port_range));
@@ -1304,6 +1313,11 @@ APST_t string_to_service_type(const char *parameter, const char *setting_name) {
 }
 
 void command_set_volume(double volume) {
+#ifdef CONFIG_FOR_MINGW
+  (void)volume;
+  if (config.cmd_set_volume)
+    warn("on-set-volume commands are not supported in this MinGW build.");
+#else
   // this has a cancellation point if waiting is enabled
   if (config.cmd_set_volume) {
     /*Spawn a child to run the program.*/
@@ -1348,9 +1362,14 @@ void command_set_volume(double volume) {
       // debug(1,"Continue after on-set-volume command");
     }
   }
+#endif
 }
 
 void command_start(void) {
+#ifdef CONFIG_FOR_MINGW
+  if (config.cmd_start)
+    warn("on-start commands are not supported in this MinGW build.");
+#else
   // this has a cancellation point if waiting is enabled or a response is awaited
   if (config.cmd_start) {
     pid_t pid;
@@ -1417,8 +1436,15 @@ void command_start(void) {
       // debug(1,"Continue after on-start command");
     }
   }
+#endif
 }
 void command_execute(const char *command, const char *extra_argument, const int block) {
+#ifdef CONFIG_FOR_MINGW
+  (void)extra_argument;
+  (void)block;
+  if (command)
+    warn("external commands are not supported in this MinGW build.");
+#else
   // this has a cancellation point if waiting is enabled
   if (command) {
     char new_command_buffer[2048];
@@ -1458,6 +1484,7 @@ void command_execute(const char *command, const char *extra_argument, const int 
       // debug(1,"Continue after on-unfixable command");
     }
   }
+#endif
 }
 
 void command_stop(void) {
@@ -2341,6 +2368,9 @@ char *debug_malloc_hex_cstring(void *packet, size_t nread) {
 
 int get_device_id(uint8_t *id, int int_length) {
 
+#ifdef CONFIG_FOR_MINGW
+  return shairport_mingw_get_device_id(id, int_length);
+#else
   uint64_t wait_time = 10000000000L; // wait up to this (ns) long to get a MAC address
 
   int response = -1;
@@ -2405,6 +2435,7 @@ int get_device_id(uint8_t *id, int int_length) {
   if (response != 0)
     warn("Can't create a device ID -- no valid MAC address can be found.");
   return response;
+#endif
 }
 
 char *bnprintf(char *buffer, ssize_t max_bytes, const char *format, ...) {

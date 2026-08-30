@@ -212,6 +212,9 @@ void *rtp_audio_receiver(void *arg) {
   ssize_t nread;
   while (1) {
     nread = recv(conn->audio_socket, packet, sizeof(packet), 0);
+#ifdef CONFIG_FOR_MINGW
+    pthread_testcancel();
+#endif
 
     uint64_t local_time_now_ns = get_absolute_time_in_ns();
     if (time_of_previous_packet_ns) {
@@ -336,6 +339,9 @@ void *rtp_control_receiver(void *arg) {
   ssize_t nread;
   while (1) {
     nread = recv(conn->control_socket, packet, sizeof(packet), 0);
+#ifdef CONFIG_FOR_MINGW
+    pthread_testcancel();
+#endif
     if (nread >= 0) {
       if ((config.diagnostic_drop_packet_fraction == 0.0) ||
           (drand48() > config.diagnostic_drop_packet_fraction)) {
@@ -647,12 +653,18 @@ void *rtp_timing_sender(void *arg) {
         strerror_r(errno, em, sizeof(em));
         debug(1, "Error %d using send-to to the timing socket: \"%s\".", errno, em);
       }
+#ifdef CONFIG_FOR_MINGW
+      pthread_testcancel();
+#endif
     } else {
       debug(3, "Timing Sender Thread -- dropping outgoing packet to simulate bad network.");
     }
 
     request_number++;
 
+#ifdef CONFIG_FOR_MINGW
+    pthread_testcancel();
+#endif
     if (request_number <= 3)
       usleep(300000); // these are thread cancellation points
     else
@@ -757,6 +769,9 @@ void *rtp_timing_receiver(void *arg) {
 
   while (1) {
     nread = recv(conn->timing_socket, packet, sizeof(packet), 0);
+#ifdef CONFIG_FOR_MINGW
+    pthread_testcancel();
+#endif
     if (conn->udp_clock_is_initialised == 0) {
       debug(2, "AP1 clock receiver thread: initialised.");
       local_to_remote_time_jitter = 0;
@@ -1216,22 +1231,17 @@ void rtp_request_resend(seq_t first, uint32_t count, rtsp_conn_info *conn) {
           (drand48() > config.diagnostic_drop_packet_fraction)) {
         // put a time limit on the sendto
 
-        struct timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
         int response;
 #ifdef CONFIG_AIRPLAY_2
         if (conn->airplay_type == ap_2) {
-          if (setsockopt(conn->ap2_control_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
-                         sizeof(timeout)) < 0)
+          if (socket_set_timeout_ms(conn->ap2_control_socket, SO_SNDTIMEO, 100) < 0)
             debug(1, "Can't set timeout on resend request socket.");
           response = sendto(conn->ap2_control_socket, req, sizeof(req), 0,
                             (struct sockaddr *)&conn->ap2_remote_control_socket_addr,
                             conn->ap2_remote_control_socket_addr_length);
         } else {
 #endif
-          if (setsockopt(conn->control_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
-                         sizeof(timeout)) < 0)
+          if (socket_set_timeout_ms(conn->control_socket, SO_SNDTIMEO, 100) < 0)
             debug(1, "Can't set timeout on resend request socket.");
           socklen_t msgsize = sizeof(struct sockaddr_in);
 #ifdef AF_INET6
@@ -1246,6 +1256,7 @@ void rtp_request_resend(seq_t first, uint32_t count, rtsp_conn_info *conn) {
         }
 #endif
         if (response == -1) {
+          socket_set_errno();
           char em[1024];
           strerror_r(errno, em, sizeof(em));
           debug(2, "Error %d using sendto to request a resend: \"%s\".", errno, em);
@@ -1632,6 +1643,7 @@ void *rtp_ap2_control_receiver(void *arg) {
 
     nread = recvfrom(conn->ap2_control_socket, packet, sizeof(packet), 0,
                      (struct sockaddr *)&from_sock_addr, &from_sock_addr_length);
+    pthread_testcancel();
     uint64_t time_now = get_absolute_time_in_ns();
     int64_t time_since_start = time_now - start_time;
 
