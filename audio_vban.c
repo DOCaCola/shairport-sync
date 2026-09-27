@@ -95,6 +95,10 @@ static uint64_t next_packet_time = 0;
 static uint64_t pacing_remainder = 0;
 static int next_packet_time_valid = 0;
 static uint64_t failed_packets_in_burst = 0;
+static uint64_t pacing_report_time = 0;
+static uint64_t pacing_packets = 0;
+static uint64_t pacing_late_packets = 0;
+static uint64_t pacing_max_lateness = 0;
 
 #ifdef CONFIG_FOR_MINGW
 static HANDLE pacing_timer = NULL;
@@ -129,6 +133,10 @@ static void reset_packetizer(void) {
   next_packet_time = 0;
   pacing_remainder = 0;
   next_packet_time_valid = 0;
+  pacing_report_time = 0;
+  pacing_packets = 0;
+  pacing_late_packets = 0;
+  pacing_max_lateness = 0;
 }
 
 static uint64_t frames_to_ns(uint64_t frames) {
@@ -454,8 +462,27 @@ static int send_buffered_packet(void) {
   }
 
   int response = wait_until(packet_time);
-  if (response == 0)
+  if (response == 0) {
+    uint64_t send_time = get_absolute_time_in_ns();
+    uint64_t lateness = send_time > packet_time ? send_time - packet_time : 0;
+    pacing_packets++;
+    if (lateness > frames_to_ns(buffered_samples))
+      pacing_late_packets++;
+    if (lateness > pacing_max_lateness)
+      pacing_max_lateness = lateness;
     response = send_packet(buffered_audio, buffered_samples);
+    if (pacing_report_time == 0)
+      pacing_report_time = send_time;
+    if (send_time - pacing_report_time >= 10000000000ULL) {
+      debug(1, "vban: pacing: %" PRIu64 " packets, %" PRIu64
+               " over one packet late, maximum lateness %.3f ms.",
+            pacing_packets, pacing_late_packets, pacing_max_lateness * 1e-6);
+      pacing_report_time = send_time;
+      pacing_packets = 0;
+      pacing_late_packets = 0;
+      pacing_max_lateness = 0;
+    }
+  }
 
   next_packet_time = advance_packet_time(packet_time, buffered_samples);
   next_packet_time_valid = 1;
