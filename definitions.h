@@ -3,7 +3,6 @@
 
 #include <sys/socket.h>
 
-#include "config.h"
 
 #ifdef CONFIG_FOR_MINGW
 #include "utilities/mingw_compat.h"

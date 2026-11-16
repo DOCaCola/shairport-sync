@@ -32,6 +32,10 @@
 #include <uuid/uuid.h>
 #endif
 
+#ifndef UUID_STR_LEN
+#define UUID_STR_LEN 37 // as in util-linux's uuid.h: 36 characters plus the NUL
+#endif
+
 #include "generate_random_uuid.h"
 
 // user is responsible for deallocating returned string

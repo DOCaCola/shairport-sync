@@ -6,3 +6,31 @@
 char *str_replace(const char *string, const char *substr, const char *replacement);
 
 char *service_name(const char *raw_service_name);
+
+// Returns non-zero if element is a valid element of a D-Bus well-known bus name, e.g. "Kitchen".
+int dbus_bus_name_element_is_valid(const char *element);
+
+// base_name with element appended, e.g. "org.gnome.ShairportSync.Kitchen", or a copy of
+// base_name if element is NULL. Free the result with free().
+char *dbus_bus_name(const char *base_name, const char *element);
+
+// read in a 64-bit unsigned number
+int parse_u64(const char *str, uint64_t *out);
+
+// Read an entire file into a newly-allocated, null-terminated buffer.
+// Returns NULL (with errno set) if the file cannot be opened or read.
+// The caller must free the returned buffer.
+char *read_file_to_string(const char *pathname);
+
+// Returns a newly malloc'd string with libconfig-type comments removed:
+char *strip_comments(const char *src);
+
+// Expand ${NAME} environment-variable references in the given text, taking the
+// values from the process environment. "${NAME}" (NAME matching
+// [A-Za-z_][A-Za-z0-9_]*) is replaced by the value of NAME; "$${" yields a
+// literal "${"; a reference to an unset variable is a fatal error. Text with no
+// "${" is returned unchanged. name_for_errors identifies the text in error
+// messages. Returns a newly-allocated, null-terminated string to be freed by
+// the caller.
+
+char *expand_environment_variables(const char *text, const char *name_for_errors);

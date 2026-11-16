@@ -42,7 +42,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "tinysvcmdns.h"
+#include "tinysvcmdns/tinysvcmdns.h"
 
 struct mdns_tinysvcmdns_server {
   struct mdnsd *server;

@@ -25,7 +25,6 @@ SOFTWARE.
 #include "config.h"
 #include "debug.h"
 #include <ctype.h> // for isprint()
-#include <unistd.h> // for usleep()
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -34,6 +33,7 @@ SOFTWARE.
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <unistd.h> // for usleep()
 
 #ifdef CONFIG_FOR_MINGW
 #include <io.h>

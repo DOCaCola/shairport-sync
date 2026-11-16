@@ -18,6 +18,14 @@ lib_mpris_interface_a_CFLAGS = -pthread
 
 bin_PROGRAMS = shairport-sync
 
+# check_PROGRAMS = tests/test_audio_bitrate tests/test_metadata_queue
+# TESTS = $(check_PROGRAMS)
+# tests_test_audio_bitrate_SOURCES = tests/test_audio_bitrate.c audio_bitrate.h
+# tests_test_audio_bitrate_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)
+# tests_test_metadata_queue_SOURCES = tests/test_metadata_queue.c
+# tests_test_metadata_queue_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)
+# tests_test_metadata_queue_LDFLAGS = -pthread
+
 # BUILT_SOURCES get built before anything else (?)
 
 BUILT_SOURCES =
@@ -27,31 +35,38 @@ noinst_LIBRARIES =
 
 # See below for the flags for the test client program
 
-shairport_sync_SOURCES = shairport.c bonjour_strings.c mdns.c common.c rtp.c \
+shairport_sync_SOURCES = shairport.c bonjour_strings.c mdns/mdns.c common.c rtp.c \
   player.c audio.c loudness.c activity_monitor.c \
   rtsp.c \
-  utilities/debug.c utilities/network_utilities.c utilities/rtsp_message_utilities.c \
+  utilities/debug.c \
+  utilities/network_utilities.c \
+  utilities/rtsp_message_utilities.c \
   utilities/string_utilities.c \
+  utilities/general_utilities.c \
   utilities/exit.c
 
 if BUILD_FOR_MINGW
 shairport_sync_SOURCES += utilities/mingw_ifaddrs.c utilities/mingw_compat.c
 endif
 
+if USE_REMOTE_CONTROL
+shairport_sync_SOURCES +=   remote/remote.c
+endif
+
 if BUILD_FOR_DARWIN
   AM_CXXFLAGS = -I/usr/local/include -Wno-multichar -Wall -Wextra -Wno-deprecated-declarations -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
-  AM_CFLAGS = --include=utilities/debug.h -Wno-multichar -Wall -Wextra -Wno-deprecated-declarations -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
+  AM_CFLAGS = --include=config.h --include=utilities/debug.h -Wno-multichar -Wall -Wextra -Wno-deprecated-declarations -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
 else
 if BUILD_FOR_FREEBSD
   AM_CXXFLAGS = -I/usr/local/include -Wno-multichar -Wall -Wextra -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
-  AM_CFLAGS = --include=utilities/debug.h -Wno-multichar -Wall -Wextra -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
+  AM_CFLAGS = --include=config.h --include=utilities/debug.h -Wno-multichar -Wall -Wextra -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
 else
 if BUILD_FOR_OPENBSD
   AM_CXXFLAGS = -I/usr/local/include -Wno-multichar -Wall -Wextra -Wno-clobbered -Wno-psabi -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
-  AM_CFLAGS = --include=utilities/debug.h -Wno-multichar -Wall -Wextra -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
+  AM_CFLAGS = --include=config.h --include=utilities/debug.h -Wno-multichar -Wall -Wextra -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
 else
   AM_CXXFLAGS = -Wshadow -fno-common -Wno-multichar -Wall -Wextra -Wformat -Wformat=2 -Wno-clobbered -Wno-psabi -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
-  AM_CFLAGS = --include=utilities/debug.h -Wshadow -fno-common -Wno-multichar -Wall -Wextra -Wformat -Wformat=2 -Wno-clobbered -Wno-psabi -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
+  AM_CFLAGS = --include=config.h --include=utilities/debug.h -Wshadow -fno-common -Wno-multichar -Wall -Wextra -Wformat -Wformat=2 -Wno-clobbered -Wno-psabi -pthread -DSYSCONFDIR=\"$(sysconfdir)\"
 endif
 endif
 endif
@@ -81,23 +96,19 @@ AM_CFLAGS+= \
 endif
 
 if USE_AVAHI
-shairport_sync_SOURCES += mdns_avahi.c
+shairport_sync_SOURCES += mdns/mdns_avahi.c
 endif
 
 if USE_TINYSVCMDNS
-shairport_sync_SOURCES += mdns_tinysvcmdns.c tinysvcmdns.c
+shairport_sync_SOURCES += mdns/mdns_tinysvcmdns.c mdns/tinysvcmdns/tinysvcmdns.c
 endif
 
 if USE_EXTERNAL_MDNS
-shairport_sync_SOURCES += mdns_external.c
+shairport_sync_SOURCES += mdns/mdns_external.c
 endif
 
 if USE_ALSA
 shairport_sync_SOURCES += audio_alsa.c
-endif
-
-if USE_JACK
-shairport_sync_SOURCES += audio_jack.c
 endif
 
 if USE_SNDIO
@@ -120,12 +131,12 @@ if USE_DUMMY
 shairport_sync_SOURCES += audio_dummy.c
 endif
 
-if USE_AO
-shairport_sync_SOURCES += audio_ao.c
+if USE_COREAUDIO
+shairport_sync_SOURCES += audio_coreaudio.c
 endif
 
-if USE_SOUNDIO
-shairport_sync_SOURCES += audio_soundio.c
+if USE_AO
+shairport_sync_SOURCES += audio_ao.c
 endif
 
 if USE_PULSEAUDIO
@@ -137,16 +148,17 @@ shairport_sync_SOURCES += audio_pw.c
 endif
 
 if USE_CONVOLUTION
+shairport_sync_SOURCES += utilities/ir_file_support.c
 shairport_sync_SOURCES += FFTConvolver/AudioFFT.cpp FFTConvolver/FFTConvolver.cpp FFTConvolver/Utilities.cpp FFTConvolver/convolver.cpp FFTConvolver/ConvolverThreadPool.cpp
 AM_CXXFLAGS += -std=c++11
 endif
 
 if USE_DNS_SD
-shairport_sync_SOURCES += mdns_dns_sd.c
+shairport_sync_SOURCES += mdns/mdns_dns_sd.c
 endif
 
 if USE_METADATA
-shairport_sync_SOURCES += metadata/pc_queue.c metadata/core.c
+shairport_sync_SOURCES += metadata/pc_queue.c metadata/core.c metadata/audio_bitrate.c mdns/mdns_metadata.c
 endif
 
 if USE_METADATA_PIPE
@@ -165,6 +177,7 @@ if USE_MQTT
 shairport_sync_SOURCES += mqtt.c
 endif
 
+
 if USE_DACP_CLIENT
 shairport_sync_SOURCES += dacp.c
 shairport_sync_LDADD += lib_tinyhttp.a
@@ -173,11 +186,17 @@ lib_tinyhttp_a_SOURCES =  tinyhttp/chunk.c tinyhttp/header.c tinyhttp/http.c
 endif
 
 if USE_AIRPLAY_2
-shairport_sync_SOURCES += ap2_buffered_audio_processor.c ap2_event_receiver.c \
-  ap2_event_message_handler.c ptp-utilities.c \
+shairport_sync_SOURCES += ap2_buffered_audio_processor.c \
+  ap2_event_receiver.c \
+  ptp-utilities.c \
   utilities/buffered_read.c utilities/structured_buffer.c utilities/mod23.c \
   utilities/generate_random_uuid.c utilities/generate_device_uuid.c \
   utilities/uuid_compat.c plists/get_info_response.c
+
+if USE_METADATA_HUB
+shairport_sync_SOURCES += metadata/metadata_hub_handle_command_plist.c
+endif
+
 shairport_sync_LDADD += lib_pair_ap.a
 lib_pair_ap_a_SOURCES = pair_ap/pair.c pair_ap/pair_fruit.c pair_ap/pair_homekit.c pair_ap/pair-tlv.c
 noinst_LIBRARIES += lib_pair_ap.a
@@ -192,16 +211,23 @@ CLEANFILES +=plists/get_info_response.h plists/get_info_response.c
 
 endif
 
+if ADD_DBUS_SUPPORT
+shairport_sync_SOURCES += dbus/property-preflight/property-preflight.c
+if USE_AIRPLAY_2
+shairport_sync_SOURCES += utilities/plist_gvariant_stuff.c
+endif
+endif
+
 if USE_DBUS
 shairport_sync_LDADD += lib_dbus_interface.a
 noinst_LIBRARIES += lib_dbus_interface.a
 lib_dbus_interface_a_SOURCES = dbus-interface.c
-shairport_sync_SOURCES += dbus-service.c
+shairport_sync_SOURCES += dbus/dbus-service.c dbus/property-preflight/property-preflight-shairportsync.c
 BUILT_SOURCES += dbus-interface.h dbus-interface.c
 CLEANFILES += dbus-interface.h dbus-interface.c
 
-dbus-interface.c:  org.gnome.ShairportSync.xml
-	gdbus-codegen --interface-prefix org.gnome --generate-c-code dbus-interface $(top_srcdir)/org.gnome.ShairportSync.xml
+dbus-interface.c:  dbus/org.gnome.ShairportSync.xml
+	gdbus-codegen --interface-prefix org.gnome --generate-c-code dbus-interface $(top_srcdir)/dbus/org.gnome.ShairportSync.xml
 dbus-interface.h: dbus-interface.c
 	touch dbus-interface.h
 endif
@@ -210,12 +236,12 @@ if USE_MPRIS
 shairport_sync_LDADD += lib_mpris_interface.a
 noinst_LIBRARIES += lib_mpris_interface.a
 lib_mpris_interface_a_SOURCES = mpris-interface.c
-shairport_sync_SOURCES += mpris-service.c
+shairport_sync_SOURCES += dbus/mpris-service.c dbus/property-preflight/property-preflight-mpris.c
 BUILT_SOURCES += mpris-interface.h mpris-interface.c
 CLEANFILES += mpris-interface.h mpris-interface.c
 
-mpris-interface.c:  org.mpris.MediaPlayer2.xml
-	gdbus-codegen --interface-prefix org.mpris --generate-c-code mpris-interface $(top_srcdir)/org.mpris.MediaPlayer2.xml
+mpris-interface.c:  dbus/org.mpris.MediaPlayer2.xml
+	gdbus-codegen --interface-prefix org.mpris --generate-c-code mpris-interface $(top_srcdir)/dbus/org.mpris.MediaPlayer2.xml
 mpris-interface.h: mpris-interface.c
 	touch mpris-interface.h
 endif
@@ -225,14 +251,16 @@ noinst_PROGRAMS =
 if USE_DBUS_CLIENT
  #Make it, but don't install it anywhere
 noinst_PROGRAMS += shairport-sync-dbus-test-client
-shairport_sync_dbus_test_client_SOURCES = shairport-sync-dbus-test-client.c
+shairport_sync_dbus_test_client_SOURCES = shairport-sync-dbus-test-client.c \
+  utilities/g_variant_pretty_print.c
 shairport_sync_dbus_test_client_LDADD = lib_dbus_interface.a
 endif
 
 if USE_MPRIS_CLIENT
  #Make it, but don't install it anywhere
 noinst_PROGRAMS += shairport-sync-mpris-test-client
-shairport_sync_mpris_test_client_SOURCES = shairport-sync-mpris-test-client.c
+shairport_sync_mpris_test_client_SOURCES = shairport-sync-mpris-test-client.c \
+  utilities/g_variant_pretty_print.c
 shairport_sync_mpris_test_client_LDADD = lib_mpris_interface.a
 endif
 

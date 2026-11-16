@@ -38,6 +38,7 @@
 #include "FFTConvolver/convolver.h"
 #endif
 
+
 void addADTStoPacket(uint8_t *packet, int packetLen, int rate, int channel_configuration) {
   // https://stackoverflow.com/questions/18862715/how-to-generate-the-aac-adts-elementary-stream-with-android-mediacodec
   // with thanks!
@@ -100,9 +101,7 @@ void rtp_buffered_audio_cleanup_handler(__attribute__((unused)) void *arg) {
 
 void *rtp_buffered_audio_processor(void *arg) {
   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
-  // #include <syscall.h>
-  // debug(1, "Connection %d: rtp_buffered_audio_processor PID %d start", conn->connection_number,
-  //         syscall(SYS_gettid));
+
   conn->incoming_ssrc = 0; // reset
   conn->resampler_ssrc = 0;
 
@@ -181,7 +180,7 @@ void *rtp_buffered_audio_processor(void *arg) {
   unsigned char *payload_pointer = NULL;
   unsigned long long payload_length = 0;
   uint32_t payload_ssrc =
-      SSRC_NONE; // this is the SSRC of the payload, needed to decide if it should be muted
+      SSRC_NONE; // this is the SSRC of the payload
   uint32_t previous_ssrc = SSRC_NONE;
 
   uint32_t seq_no =
@@ -229,6 +228,11 @@ void *rtp_buffered_audio_processor(void *arg) {
 
     if ((play_enabled != 0) && (conn->ap2_play_enabled == 0)) {
       debug(2, "Play stopped.");
+#ifdef CONFIG_METADATA
+      pthread_mutex_lock_and_cleanup_push(&conn->flush_mutex);
+      reset_input_bitrate(conn);
+      pthread_cleanup_pop(1);
+#endif
       packets_played_in_this_sequence = 0; // not all blocks read are played...
 #ifdef CONFIG_CONVOLUTION
       convolver_clear_state();
@@ -255,57 +259,109 @@ void *rtp_buffered_audio_processor(void *arg) {
       if ((conn->ap2_audio_buffer_minimum_size < 0) ||
           (bytes_remaining_in_buffer < (size_t)conn->ap2_audio_buffer_minimum_size))
         conn->ap2_audio_buffer_minimum_size = bytes_remaining_in_buffer;
-
-      if (nread > 0) {
-        // get the block itself
-        // debug(1,"buffered audio packet of size %u detected.", data_len - 2);
-        nread = read_sized_block(buffered_audio, packet, data_len - 2, &bytes_remaining_in_buffer);
-        // debug(1,"block read");
-
-        // diagnostic
-        if ((conn->ap2_audio_buffer_minimum_size < 0) ||
-            (bytes_remaining_in_buffer < (size_t)conn->ap2_audio_buffer_minimum_size))
-          conn->ap2_audio_buffer_minimum_size = bytes_remaining_in_buffer;
-        // debug(1, "buffered audio packet of size %u received.", nread);
-
-        if (nread > 0) {
-          // got the block
-          blocks_read++;                  // note, this doesn't mean they are valid audio blocks
-
-          // get the sequence number
-          // see https://en.wikipedia.org/wiki/Real-time_Transport_Protocol#Packet_header
-          // the Marker bit is always set, and it and the remaining 23 bits form the sequence number
-
-          previous_seqno = seq_no;
-          seq_no = nctohl(&packet[0]) & 0x7FFFFF;
-
-          previous_timestamp = timestamp;
-          timestamp = nctohl(&packet[4]);
-
-          if (payload_ssrc != SSRC_NONE)
-            previous_ssrc = payload_ssrc;
-          payload_ssrc = nctohl(&packet[8]);
-
-          if ((payload_ssrc != previous_ssrc) && (payload_ssrc != SSRC_NONE)) {
-            if (ssrc_is_recognised(payload_ssrc) == 0) {
-              debug(2, "Unrecognised SSRC: %u.", payload_ssrc);
-            } else {
-              debug(2, "Connection %d: incoming audio encoding is%s \"%s\".",
-                    conn->connection_number, previous_ssrc == SSRC_NONE ? "" : " switching to",
-                    get_ssrc_name(payload_ssrc));
+      if (data_len >= 2) {
+        data_len = data_len - 2;
+        if ((nread > 0) && (data_len < buffer_packet_size)) {
+          // get the block itself
+          // debug(1,"buffered audio packet of size %u detected.", data_len + 2);
+          nread = read_sized_block(buffered_audio, packet, data_len, &bytes_remaining_in_buffer);
+          // debug(1,"block read");
+  
+          // diagnostic
+          if ((conn->ap2_audio_buffer_minimum_size < 0) ||
+              (bytes_remaining_in_buffer < (size_t)conn->ap2_audio_buffer_minimum_size))
+            conn->ap2_audio_buffer_minimum_size = bytes_remaining_in_buffer;
+          // debug(1, "buffered audio packet of size %u received.", nread);
+  
+          if (nread > 0) {
+            // got the block
+            blocks_read++;                  // note, this doesn't mean they are valid audio blocks
+  
+            // get the sequence number
+            // see https://en.wikipedia.org/wiki/Real-time_Transport_Protocol#Packet_header
+            // the Marker bit is always set, and it and the remaining 23 bits form the sequence number
+  
+            previous_seqno = seq_no;
+            seq_no = nctohl(&packet[0]) & 0x7FFFFF;
+  
+            previous_timestamp = timestamp;
+            timestamp = nctohl(&packet[4]);
+  
+            if (payload_ssrc != SSRC_NONE) // ignore intervening SSRC blocks
+              previous_ssrc = payload_ssrc;
+            payload_ssrc = nctohl(&packet[8]);
+            
+            if ((payload_ssrc != previous_ssrc) && (payload_ssrc != SSRC_NONE)) {
+#ifdef CONFIG_METADATA
+              pthread_mutex_lock_and_cleanup_push(&conn->flush_mutex);
+              reset_input_bitrate(conn);
+              pthread_cleanup_pop(1);
+#endif
+              if (ssrc_is_recognised(payload_ssrc) == 0) {
+                debug(2, "Unrecognised SSRC: \"%s\" in packet %" PRIu64 ".", get_ssrc_name(payload_ssrc), blocks_read);
+              } else {
+                debug(2, "Connection %d: incoming audio encoding is%s \"%s\".",
+                      conn->connection_number, previous_ssrc == SSRC_NONE ? "" : " switching to",
+                      get_ssrc_name(payload_ssrc));
+              }
             }
-          }
-
-          if ((ssrc_is_recognised(payload_ssrc) != 0) && (payload_ssrc != SSRC_NONE)) {
-            new_audio_block_needed = 0; // a valid block has been read.
-            // if necessary, set the input rate...
-            if (conn->input_rate == 0) {
-              debug(2, "Preparing initial decoding chain for %s.", get_ssrc_name(payload_ssrc));
-              prepare_decoding_chain(conn, payload_ssrc); // needed to set the input rate...
-              sequence_number_for_player =
-                  seq_no & 0xffff; // this is arbitrary -- the sequence_number_for_player numbers will
-                                   // be sequential irrespective of seq_no jumps...
-            } else {
+            
+            // experimentally decode unrecognised SSRC blocks.
+            if (ssrc_is_recognised(payload_ssrc) == 0) {
+              payload_length = 0;
+              unsigned long long new_payload_length = 0;
+              payload_pointer = m;
+              int response = -1;  // guess that there is a problem
+              if (conn->session_key != NULL) {
+                unsigned char nonce[12];
+                memset(nonce, 0, sizeof(nonce));
+                memcpy(
+                    nonce + 4, packet + nread - 8,
+                    8); // front-pad the 8-byte nonce received to get the 12-byte nonce expected
+  
+                // https://libsodium.gitbook.io/doc/secret-key_cryptography/aead/chacha20-poly1305/ietf_chacha20-poly1305_construction
+                // Note: the eight-byte nonce must be front-padded out to 12 bytes.
+  
+                // Leave leading_free_space_length bytes at the start for possible headers like
+                // an ADTS header (7 bytes)
+                memset(m, 0, leading_free_space_length);
+                response = crypto_aead_chacha20poly1305_ietf_decrypt(
+                    payload_pointer,     // where the decrypted payload will start
+                    &new_payload_length, // mlen_p
+                    NULL,                // nsec,
+                    packet +
+                        12, // the ciphertext starts 12 bytes in and is followed by the MAC tag,
+                    nread - (8 + 12), // clen -- the last 8 bytes are the nonce
+                    packet + 4,       // authenticated additional data
+                    8,                // authenticated additional data length
+                    nonce,
+                    conn->session_key); // *k
+                if (response == 0) {
+                  debug(2, "%s block %" PRIu64 " deciphered to %llu bytes.", get_ssrc_name(payload_ssrc), blocks_read, new_payload_length);
+                  debug_print_buffer(1, payload_pointer, new_payload_length);
+                } else {
+                  debug(2, "Error decrypting %s block %" PRIu64 " -- packet length %zd.", get_ssrc_name(payload_ssrc), blocks_read,
+                        nread);
+                }
+              } else {
+                debug(2,
+                      "No session key, so %s block %" PRIu64 " can not be deciphered -- skipped.", get_ssrc_name(payload_ssrc), blocks_read);
+              }
+            }
+  
+  
+            if (ssrc_is_recognised(payload_ssrc) != 0) {
+              new_audio_block_needed = 0; // a valid block has been read.
+              // if necessary, set the input rate...
+              if (conn->input_rate == 0) {
+                debug(2, "Preparing initial decoding chain for %s.", get_ssrc_name(payload_ssrc));
+                prepare_decoding_chain(conn, payload_ssrc); // needed to set the input rate...
+                sequence_number_for_player =
+                    seq_no & 0xffff; // this is arbitrary -- the sequence_number_for_player numbers will
+                                     // be sequential irrespective of seq_no jumps...
+              }
+            } 
+            if (blocks_read > 1) {
               uint32_t t_expected_seqno = (previous_seqno + 1) & 0x7fffff;
               if (t_expected_seqno != seq_no) {
                 debug(2,
@@ -320,7 +376,7 @@ void *rtp_buffered_audio_processor(void *arg) {
                 debug(2, "reading block %u, the timestamp %u differs from expected_timestamp %u.",
                       seq_no, timestamp, t_expected_timestamp);
               }
-            }
+            }          
           }
         }
       }
@@ -343,34 +399,56 @@ void *rtp_buffered_audio_processor(void *arg) {
       pthread_mutex_lock_and_cleanup_push(&conn->flush_mutex);
       if (blocks_read != 0) {
         if (conn->ap2_immediate_flush_requested != 0) {
+          int flush_finished = 0;
           if (ap2_immediate_flush_requested == 0) {
-            debug(2, "immediate flush started at sequence number %u until sequence number of %u.",
+#ifdef CONFIG_METADATA
+            reset_input_bitrate(conn);
+#endif
+            debug(3, "immediate flush started at sequence number %u until sequence number of %u.",
                   seq_no, conn->ap2_immediate_flush_until_sequence_number);
           }
-          if ((blocks_read != 0) &&
-              ((a_minus_b_mod23(seq_no, conn->ap2_immediate_flush_until_sequence_number) > 0))) {
-
-            if (payload_ssrc == SSRC_NONE) {
-              debug(2,
-                    "immediate flush endpoint followed by a SSRC_NONE packet. Seq_no is %u, "
-                    "conn->ap2_immediate_flush_until_sequence_number is %u.",
-                    seq_no, conn->ap2_immediate_flush_until_sequence_number);
-
-            } else {
-              debug(1,
-                    "immediate flush may have escaped its endpoint! Seq_no is %u, "
-                    "conn->ap2_immediate_flush_until_sequence_number is %u.",
-                    seq_no, conn->ap2_immediate_flush_until_sequence_number);
+          
+          if (conn->ap2_immediate_flush_until_sequence_number != 0) {
+            if (a_minus_b_mod23(seq_no, conn->ap2_immediate_flush_until_sequence_number) > 0) {
+              if (payload_ssrc == SSRC_NONE) {
+                debug(3,
+                      "immediate flush endpoint followed by a SSRC_NONE packet. Seq_no is %u, "
+                      "conn->ap2_immediate_flush_until_sequence_number is %u.",
+                      seq_no, conn->ap2_immediate_flush_until_sequence_number);
+  
+              } else {
+                debug(3,
+                      "immediate flush may have escaped its endpoint! Seq_no is %u, "
+                      "conn->ap2_immediate_flush_until_sequence_number is %u.",
+                      seq_no, conn->ap2_immediate_flush_until_sequence_number);
+              }
+              flush_finished = 1;
             }
+  
+            if (a_minus_b_mod23(seq_no, conn->ap2_immediate_flush_until_sequence_number) >= 0) {
+              debug(3,
+                    "immediate flush completed at seq_no: %u, "
+                    "conn->ap2_immediate_flush_until_sequence_number: %u.",
+                    seq_no, conn->ap2_immediate_flush_until_sequence_number);
+              flush_finished = 1;
+            }
+          } else {
+            flush_finished = 1;
+          // A flush to Block 0 looks like a bug in HomePod OS 27.
+          /*
+            // look at the flushUntilTS and the present one
+            int32_t timestamp_difference = conn->ap2_immediate_flush_until_rtp_timestamp - timestamp;
+            debug(1, "ap2_immediate_flush_until_timestamp %u and current timestamp %u difference %d.",
+              conn->ap2_immediate_flush_until_rtp_timestamp,
+              timestamp,
+              timestamp_difference);
+            if (timestamp_difference <= 0) {
+              flush_finished = 1;
+            }
+          */
           }
-
-          if ((blocks_read != 0) &&
-              ((a_minus_b_mod23(seq_no, conn->ap2_immediate_flush_until_sequence_number) >= 0))) {
-            debug(2,
-                  "immediate flush completed at seq_no: %u, "
-                  "conn->ap2_immediate_flush_until_sequence_number: %u.",
-                  seq_no, conn->ap2_immediate_flush_until_sequence_number);
-
+          
+          if (flush_finished != 0) {
             conn->ap2_immediate_flush_requested = 0;
             ap2_immediate_flush_requested = 0;
             // debug(1, "flushed to %u, requested %u.", seq_no,
@@ -381,7 +459,7 @@ void *rtp_buffered_audio_processor(void *arg) {
             for (f = 0; f < MAX_DEFERRED_FLUSH_REQUESTS; f++) {
               if ((conn->ap2_deferred_flush_requests[f].inUse != 0) &&
                   (conn->ap2_deferred_flush_requests[f].active == 0)) {
-                debug(1,
+                debug(3,
                       "deferred flush cancelled by an immediate flush:  flushFromTS: %12u, "
                       "flushFromSeq: %12u, "
                       "flushUntilTS: %12u, flushUntilSeq: %12u, timestamp: %12u.",
@@ -395,7 +473,7 @@ void *rtp_buffered_audio_processor(void *arg) {
             }
 
           } else {
-            debug(4, "immediate flush of block %u until block %u", seq_no,
+            debug(3, "immediate flush of block %u until block %u", seq_no,
                   conn->ap2_immediate_flush_until_sequence_number);
             ap2_immediate_flush_requested = 1;
             new_audio_block_needed = 1; //
@@ -411,18 +489,21 @@ void *rtp_buffered_audio_processor(void *arg) {
         if (conn->ap2_deferred_flush_requests[f].inUse != 0) {
           if ((conn->ap2_deferred_flush_requests[f].flushFromSeq == seq_no) &&
               (conn->ap2_deferred_flush_requests[f].flushUntilSeq != seq_no)) {
-            debug(2,
+            debug(3,
                   "deferred flush activated:  flushFromTS: %12u, flushFromSeq: %12u, "
                   "flushUntilTS: %12u, flushUntilSeq: %12u, timestamp: %12u.",
                   conn->ap2_deferred_flush_requests[f].flushFromTS,
                   conn->ap2_deferred_flush_requests[f].flushFromSeq,
                   conn->ap2_deferred_flush_requests[f].flushUntilTS,
                   conn->ap2_deferred_flush_requests[f].flushUntilSeq, timestamp);
+#ifdef CONFIG_METADATA
+            reset_input_bitrate(conn);
+#endif
             conn->ap2_deferred_flush_requests[f].active = 1;
             new_audio_block_needed = 1;
           }
           if (conn->ap2_deferred_flush_requests[f].flushUntilSeq == seq_no) {
-            debug(2,
+            debug(3,
                   "deferred flush terminated: flushFromTS: %12u, flushFromSeq: %12u, "
                   "flushUntilTS: %12u, flushUntilSeq: %12u, timestamp: %12u.",
                   conn->ap2_deferred_flush_requests[f].flushFromTS,
@@ -435,7 +516,7 @@ void *rtp_buffered_audio_processor(void *arg) {
                      0) {
             // now, do a modulo 2^23 unsigned int calculation to see if we may have overshot the
             // flushUntilSeq
-            debug(2,
+            debug(3,
                   "deferred flush terminated due to overshoot at block %u: flushFromTS: %12u, "
                   "flushFromSeq: %12u, "
                   "flushUntilTS: %12u, flushUntilSeq: %12u, timestamp: %12u.",
@@ -448,7 +529,7 @@ void *rtp_buffered_audio_processor(void *arg) {
             debug(2, "immediate flush was %s.", ap2_immediate_flush_requested == 0 ? "off" : "on");
           } else if (conn->ap2_deferred_flush_requests[f].active != 0) {
             new_audio_block_needed = 1;
-            debug(4,
+            debug(3,
                   "deferred flush of block: %u, timestamp: %u, SSRC: \"%s\". flushFromTS: %12u, "
                   "flushFromSeq: %12u, "
                   "flushUntilTS: %12u, flushUntilSeq: %12u, timestamp: %12u.",
@@ -651,9 +732,11 @@ void *rtp_buffered_audio_processor(void *arg) {
                     if (skip_this_block == 0) {
                       uint32_t packet_size = player_put_packet(
                           payload_ssrc, sequence_number_for_player, timestamp, payload_pointer,
-                          payload_length, mute, timestamp_difference, conn);
+                          payload_length, mute, timestamp_difference, conn, seq_no);
                       debug(4, "block %u, timestamp %u, length %u sent to the player.", seq_no,
                             timestamp, packet_size);
+                      // keep the 64-bit timestamp extension reference up to date
+                      note_ptp_rtp_timestamp(conn, timestamp);
                       sequence_number_for_player++;                 // simply increment
                       expected_timestamp = timestamp + packet_size; // for the next time
                       packets_played_in_this_sequence++;
@@ -662,7 +745,7 @@ void *rtp_buffered_audio_processor(void *arg) {
                 } else {
                   debug(3,
                         "skipped deciphering block %u with timestamp %u because its lead time is "
-                        "out of range at %f "
+                        "out of range at %g "
                         "seconds.",
                         seq_no, timestamp, lead_time * 1.0E-9);
                   uint32_t currentAnchorRTP = 0;

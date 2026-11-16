@@ -4,11 +4,15 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
-#include "config.h"
 #include "definitions.h"
 
 #ifdef CONFIG_MBEDTLS
+#include <mbedtls/version.h>
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include <psa/crypto.h>
+#else
 #include <mbedtls/aes.h>
+#endif
 #endif
 
 #ifdef CONFIG_POLARSSL
@@ -20,6 +24,10 @@
 #define MAX_DEFERRED_FLUSH_REQUESTS 10
 #include "pair_ap/pair.h"
 #include <plist/plist.h>
+#endif
+
+#ifdef CONFIG_METADATA
+#include "metadata/audio_bitrate_structs.h"
 #endif
 
 #ifdef CONFIG_FFMPEG
@@ -189,6 +197,11 @@ typedef struct stats { // statistics for running averages
 // problem in an embedded device.
 
 #define BUFFER_FRAMES 1024
+#ifdef CONFIG_METADATA
+#if BUFFER_FRAMES != AUDIO_BITRATE_HISTORY_SIZE
+#error "Bitrate history must cover the player packet window"
+#endif
+#endif
 
 // maximum number of frames that can be added or removed from a packet_count
 #define INTERPOLATION_LIMIT 20
@@ -214,6 +227,11 @@ typedef enum {
   remote_control_stream,
   classic_airplay_stream
 } airplay_stream_c; // "c" for category
+
+typedef struct {
+  uint64_t value; // the value
+  int valid;      // set to true if valid
+} uint64_record_t;
 
 #ifdef CONFIG_AIRPLAY_2
 typedef enum { ts_ntp, ts_ptp } timing_t;
@@ -257,6 +275,8 @@ typedef struct {
 typedef struct {
   int connection_number;           // for debug ID purposes, nothing else...
   int is_playing;                  // set true by player_play, set false by player_stop
+  uint64_t total_frames_sent_to_play;
+  uint64_t frames_played; // allowing for any delay
   int input_format_is_valid;       // set when the input format is known and set in this structure
   unsigned int sync_samples_index; // for estimating the gap between the highest and lowest timing
                                    // error over the past n samples
@@ -327,6 +347,15 @@ typedef struct {
   int64_t time_since_play_started; // nanoseconds
                                    // stats
   uint64_t missing_packets, late_packets, too_late_packets, resend_requests;
+#ifdef CONFIG_METADATA
+  // all for audio bitrate, missing packet, retries metadata
+  /* Protected by flush_mutex, including the packet history. */
+  audio_bitrate_meter input_bitrate;
+  uint64_t input_bitrate_generation;
+  uint32_t input_bitrate_ssrc;
+  uint64_t last_receiver_stats; // time when starts were last sent
+#endif
+
   int decoder_in_use;
   // debug variables
   int last_seqno_valid;
@@ -350,7 +379,11 @@ typedef struct {
   int do_loudness; // if loudness is requested and there is no external mixer
 
 #ifdef CONFIG_MBEDTLS
+#if MBEDTLS_VERSION_MAJOR >= 4
+  psa_key_id_t dctx; // the AES key, imported into PSA
+#else
   mbedtls_aes_context dctx;
+#endif
 #endif
 
 #ifdef CONFIG_POLARSSL
@@ -414,6 +447,7 @@ typedef struct {
                                // (will be unspecified if not build for AirPlay 2)
 
 #ifdef CONFIG_AIRPLAY_2
+  uint64_record_t localTimeToAppleAbsoluteTimeOffset; // add this to get_absolute_time_in_ns to get Apple Absolute Time
   plist_t sessionPlist;
   char *airplay_gid; // UUID in the Bonjour advertisement -- if NULL, the group UUID is the same as
                      // the pi UUID
@@ -431,11 +465,17 @@ typedef struct {
 
   int ap2_event_receiver_exited;
 
-  int last_anchor_info_is_valid;
   uint32_t last_anchor_rtptime;
   uint64_t last_anchor_local_time;
-  uint64_t last_anchor_time_of_update;
   uint64_t last_anchor_validity_start_time;
+
+  // 64-bit extensions of the 32-bit RTP timestamps on a PTP connection -- see
+  // extend_rtp_timestamp() in rtp.c. These four fields are only ever accessed with
+  // reference_time_mutex held.
+  uint64_t anchor_rtptime_extended;
+  uint64_t last_anchor_rtptime_extended;
+  uint64_t rtp_timestamp_extension_reference; // extended timestamp of the newest audio block
+  int rtp_timestamp_extension_reference_is_valid;
 
   int ap2_immediate_flush_requested;
   uint32_t ap2_immediate_flush_until_rtp_timestamp;
@@ -448,6 +488,7 @@ typedef struct {
 
   int ap2_rate;         // protect with flush mutex, 0 means don't play, 1 means play
   int ap2_play_enabled; // protect with flush mutex
+
 
   ap2_pairing ap2_pairing_context;
   struct pair_result *pair_setup_result; // need to keep the shared secret
@@ -470,7 +511,6 @@ typedef struct {
   uint64_t compression;
   unsigned char *session_key; // needs to be free'd at the end
   char *ap2_client_name;      // needs to be free'd at teardown phase 2
-  uint64_t frames_packet;
   uint64_t type;                  // 96 (Realtime Audio), 103 (Buffered Audio), 130 (Remote Control)
   uint64_t networkTimeTimelineID; // the clock ID used by the player
   uint8_t groupContainsGroupLeader; // information coming from the SETUP
@@ -607,8 +647,14 @@ void player_flush(uint32_t timestamp, rtsp_conn_info *conn);
 
 seq_t get_revised_seqno(rtsp_conn_info *conn, uint32_t timestamp);
 void clear_buffers_from(rtsp_conn_info *conn, seq_t from_here);
+#ifdef CONFIG_METADATA
+/* Caller holds flush_mutex. Invalidate in-flight accounting and publish a reset. */
+void reset_input_bitrate(rtsp_conn_info *conn);
+#endif
+
 uint32_t player_put_packet(uint32_t ssrc, seq_t seqno, uint32_t actual_timestamp, uint8_t *data,
-                           size_t len, int mute, int32_t timestamp_gap, rtsp_conn_info *conn);
+                           size_t len, int mute, int32_t timestamp_gap, rtsp_conn_info *conn,
+                           uint32_t packet_sequence);
 int64_t monotonic_timestamp(uint32_t timestamp,
                             rtsp_conn_info *conn); // add an epoch to the timestamp. The monotonic
 // timestamp guaranteed to start between 2^32 2^33
@@ -620,6 +666,7 @@ int64_t monotonic_timestamp(uint32_t timestamp,
 double suggested_volume(rtsp_conn_info *conn); // volume suggested for the connection
 
 const char *get_ssrc_name(ssrc_t ssrc);
+uint32_t get_ssrc_rate(ssrc_t ssrc);
 size_t get_ssrc_block_length(ssrc_t ssrc);
 
 const char *get_category_string(airplay_stream_c cat);
