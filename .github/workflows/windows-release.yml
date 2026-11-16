@@ -21,6 +21,12 @@ jobs:
         shell: msys2 {0}
 
     steps:
+      # MSYS2's git does not read the runner's core.autocrlf=true, so CRLF
+      # checkouts would make git describe report every build as dirty
+      - name: Keep LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Check out Shairport Sync
         uses: actions/checkout@v7
         with:
@@ -72,6 +78,7 @@ jobs:
 
       - name: Build Shairport Sync
         run: |
+          git fetch --tags https://github.com/mikebrady/shairport-sync.git
           autoreconf -fi
           ./configure --with-ao --with-vban --with-soxr --with-tinysvcmdns --with-ssl=openssl \
             --with-airplay-2 --with-ffmpeg --without-configfiles --with-mqtt-client
