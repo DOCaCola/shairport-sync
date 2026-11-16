@@ -1,0 +1,124 @@
+name: Windows release (MSYS2 UCRT64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nqptp_ref:
+        description: "DOCaCola/nqptp branch, tag or commit to bundle"
+        required: true
+        default: main
+  push:
+    tags:
+      - "windows-*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out Shairport Sync
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check out NQPTP
+        uses: actions/checkout@v7
+        with:
+          repository: DOCaCola/nqptp
+          ref: ${{ inputs.nqptp_ref || 'main' }}
+          path: nqptp
+          fetch-depth: 0
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          release: false
+          update: true
+          install: >-
+            git
+            make
+            autotools
+            vim
+            zip
+          pacboy: >-
+            gcc:p
+            pkgconf:p
+            ffmpeg:p
+            libao:p
+            libconfig:p
+            libgcrypt:p
+            libplist:p
+            libsodium:p
+            libsoxr:p
+            mosquitto:p
+            openssl:p
+            popt:p
+
+      - name: Build NQPTP
+        working-directory: nqptp
+        run: |
+          # the fork carries no tags; upstream's give git describe its version base
+          git fetch --tags https://github.com/mikebrady/nqptp.git
+          autoreconf -fi
+          ./configure
+          make -j4
+          ./nqptp.exe -V
+
+      - name: Build Shairport Sync
+        run: |
+          autoreconf -fi
+          ./configure --with-ao --with-vban --with-soxr --with-tinysvcmdns --with-ssl=openssl \
+            --with-airplay-2 --with-ffmpeg --without-configfiles --with-mqtt-client
+          make -j4
+          ./shairport-sync.exe -V
+
+      - name: Package
+        id: package
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            name="${GITHUB_REF_NAME}"
+          else
+            name="git-$(git rev-parse --short HEAD)"
+          fi
+          pkg="shairport-sync-${name}-windows-x86_64"
+          mkdir -p "dist/${pkg}"
+          cp shairport-sync.exe nqptp/nqptp.exe "dist/${pkg}/"
+          ldd shairport-sync.exe nqptp/nqptp.exe | awk '{print $3}' | grep '^/ucrt64/' | sort -u |
+            xargs -I{} cp {} "dist/${pkg}/"
+          cp scripts/shairport-sync.conf "dist/${pkg}/shairport-sync.conf.sample"
+          cp LICENSES "dist/${pkg}/LICENSES"
+          cp COPYING "dist/${pkg}/COPYING"
+          cp nqptp/LICENSE "dist/${pkg}/nqptp-LICENSE"
+          {
+            echo "Shairport Sync: $(./shairport-sync.exe -V)"
+            echo "Shairport Sync commit: $(git rev-parse HEAD)"
+            echo "NQPTP: $(nqptp/nqptp.exe -V)"
+            echo "NQPTP commit: $(git -C nqptp rev-parse HEAD)"
+          } > dist/NOTES.txt
+          { cat dist/NOTES.txt; echo "MSYS2 packages:"; pacman -Q; } > "dist/${pkg}/BUILDINFO.txt"
+          (cd "dist/${pkg}" && sha256sum *.exe *.dll > SHA256SUMS.txt)
+          (cd dist && zip -r -9 "${pkg}.zip" "${pkg}")
+          echo "name=${pkg}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.zip
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "dist/${{ steps.package.outputs.name }}.zip" `
+            --repo "${{ github.repository }}" `
+            --title "Shairport Sync for Windows ${{ github.ref_name }}" `
+            --notes-file dist/NOTES.txt
