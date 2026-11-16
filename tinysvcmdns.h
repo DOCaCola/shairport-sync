@@ -217,6 +217,10 @@ struct mdnsd *mdnsd_start();
 
 int mdnsd_add_ipv4_interface(struct mdnsd *s, uint32_t interface_addr);
 
+// joins the IPv6 mDNS group on the interface with the given index
+// and sends to it as well as to the IPv4 interfaces
+int mdnsd_add_ipv6_interface(struct mdnsd *s, unsigned int ifindex);
+
 // stops the given MDNS responder instance
 void mdnsd_stop(struct mdnsd *s);
 

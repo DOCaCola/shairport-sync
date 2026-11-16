@@ -44,6 +44,9 @@
 #include <unistd.h>
 
 #include "metadata/hub.h"
+#ifdef CONFIG_METADATA
+#include "metadata/core.h"
+#endif
 #include "tinyhttp/http.h"
 #include "utilities/network_utilities.h"
 
@@ -400,6 +403,7 @@ void relinquish_dacp_server_information(rtsp_conn_info *conn) {
 // Thus, we can keep the DACP port that might have previously been discovered
 void set_dacp_server_information(rtsp_conn_info *conn) {
   // debug(1, "set_dacp_server_information");
+  int dacp_port_withdrawn = 0;
   pthread_mutex_lock(&dacp_server_information_lock);
   dacp_server.players_connection_thread_index = conn->connection_number;
 
@@ -408,6 +412,7 @@ void set_dacp_server_information(rtsp_conn_info *conn) {
       strncpy(dacp_server.dacp_id, conn->dacp_id, sizeof(dacp_server.dacp_id) - 1);
     else
       dacp_server.dacp_id[0] = '\0';
+    dacp_port_withdrawn = dacp_server.port != 0;
     dacp_server.port = 0;
     dacp_server.scan_enable = 0;
     dacp_server.connection_family = conn->connection_ip_family;
@@ -462,6 +467,11 @@ void set_dacp_server_information(rtsp_conn_info *conn) {
   debug(3, "set_dacp_server_information set active-remote id to %s.", dacp_server.active_remote_id);
   pthread_cond_signal(&dacp_server_information_cv);
   pthread_mutex_unlock(&dacp_server_information_lock);
+#ifdef CONFIG_METADATA
+  // The port published for the previous remote no longer applies.
+  if (dacp_port_withdrawn)
+    send_ssnc_metadata('dapo', "0", strlen("0"), 0);
+#endif
 }
 
 void dacp_monitor_port_update_callback(const char *dacp_id, uint16_t port) {
@@ -926,14 +936,10 @@ void *dacp_monitor_thread_code(__attribute__((unused)) void *na) {
         response = NULL;
       }
       */
-      unsigned int scan_interval = metadata_store.player_thread_active
-                                       ? config.scan_interval_when_active
-                                       : config.scan_interval_when_inactive;
-      while (scan_interval-- != 0) {
-        // MinGW sleep() is not a pthread cancellation point.
-        pthread_testcancel();
-        sleep(1);
-      }
+      if (metadata_store.player_thread_active)
+        sleep(config.scan_interval_when_active);
+      else
+        sleep(config.scan_interval_when_inactive);
     }
   }
   debug(1, "DACP monitor thread exiting -- should never happen.");

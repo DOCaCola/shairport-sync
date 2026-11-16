@@ -220,7 +220,6 @@ void *rtp_buffered_audio_processor(void *arg) {
   reset_buffer(conn); // in case there is any garbage in the player
 
   do {
-    pthread_testcancel();
 
     if ((play_enabled == 0) && (conn->ap2_play_enabled != 0)) {
       // play newly started
@@ -695,12 +694,10 @@ void *rtp_buffered_audio_processor(void *arg) {
             }
             usleep(((1000000 * conn->frames_per_packet) / conn->input_rate) *
                    2); // wait for approximately the length of two packets
-            pthread_testcancel();
           }
         } else {
           debug(4, "just you wait, Henry Higgins, without valid timing information...");
           usleep(20000); // just you wait, Henry Higgins...
-          pthread_testcancel();
         }
       }
     }

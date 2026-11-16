@@ -1226,15 +1226,25 @@ size_t mdns_encode_pkt(struct mdns_pkt *answer, uint8_t *pkt_buf, size_t pkt_len
 
 #define SERVICES_DNS_SD_NLABEL ((uint8_t *)"\x09_services\x07_dns-sd\x04_udp\x05local")
 
+#define MDNS_SEND_IPV4 1
+#define MDNS_SEND_IPV6 2
+#define MDNS_SEND_ALL (MDNS_SEND_IPV4 | MDNS_SEND_IPV6)
+
+static const uint8_t mdns_ipv6_group[16] = {0xff, 0x02, 0, 0, 0, 0, 0, 0,
+                                            0,    0,    0, 0, 0, 0, 0, 0xfb};
+
 struct mdnsd {
   pthread_mutex_t data_lock;
   pthread_mutex_t send_lock;
   pthread_t thread;
   int sockfd;
+  int sockfd6; // created when the first IPv6 interface is added; guarded by send_lock
   int notify_pipe[2];
   int stop_flag;
   uint32_t *ipv4_interfaces;
   size_t ipv4_interface_count;
+  unsigned int *ipv6_interfaces;
+  size_t ipv6_interface_count;
 
   struct rr_group *group;
   struct rr_list *announce;
@@ -1247,6 +1257,8 @@ struct mdnsd {
 struct mdns_service {
   struct rr_list *entries;
 };
+
+int write_pipe(int s, char *buf, int len);
 
 /////////////////////////////////
 
@@ -1291,7 +1303,34 @@ static int create_recv_sock() {
   return sd;
 }
 
-static ssize_t send_packet(struct mdnsd *s, const void *data, size_t len) {
+static int create_recv_sock6(void) {
+  int sd = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (sd < 0) {
+    socket_set_errno();
+    return -1;
+  }
+
+  int on = 1;
+  struct sockaddr_in6 serveraddr;
+  memset(&serveraddr, 0, sizeof(serveraddr));
+  serveraddr.sin6_family = AF_INET6;
+  serveraddr.sin6_port = htons(MDNS_PORT); // the unspecified address receives multicast
+
+  if ((setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&on, sizeof(on)) < 0) ||
+      (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on)) < 0) ||
+      (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) ||
+      // enable loopback in case someone else needs the data
+      (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, (char *)&on, sizeof(on)) < 0)) {
+    int saved_errno = socket_set_errno();
+    safe_socket_close(&sd);
+    errno = saved_errno;
+    return -1;
+  }
+
+  return sd;
+}
+
+static ssize_t send_packet(struct mdnsd *s, const void *data, size_t len, int families) {
   static struct sockaddr_in toaddr;
   if (toaddr.sin_family != AF_INET) {
     memset(&toaddr, 0, sizeof(struct sockaddr_in));
@@ -1304,7 +1343,7 @@ static ssize_t send_packet(struct mdnsd *s, const void *data, size_t len) {
   int saved_errno = ENETUNREACH;
 
   pthread_mutex_lock(&s->send_lock);
-  for (size_t i = 0; i < s->ipv4_interface_count; i++) {
+  for (size_t i = 0; (families & MDNS_SEND_IPV4) && (i < s->ipv4_interface_count); i++) {
     struct in_addr iface = {.s_addr = s->ipv4_interfaces[i]};
     if (setsockopt(s->sockfd, IPPROTO_IP, IP_MULTICAST_IF, (char *)&iface, sizeof(iface)) < 0) {
       saved_errno = socket_set_errno();
@@ -1313,6 +1352,28 @@ static ssize_t send_packet(struct mdnsd *s, const void *data, size_t len) {
 
     ssize_t sent = sendto(s->sockfd, data, len, 0, (struct sockaddr *)&toaddr,
                           sizeof(struct sockaddr_in));
+    if (sent < 0)
+      saved_errno = socket_set_errno();
+    else
+      response = sent;
+  }
+
+  for (size_t i = 0; (families & MDNS_SEND_IPV6) && (i < s->ipv6_interface_count); i++) {
+    unsigned int ifindex = s->ipv6_interfaces[i];
+    if (setsockopt(s->sockfd6, IPPROTO_IPV6, IPV6_MULTICAST_IF, (char *)&ifindex,
+                   sizeof(ifindex)) < 0) {
+      saved_errno = socket_set_errno();
+      continue;
+    }
+
+    struct sockaddr_in6 toaddr6;
+    memset(&toaddr6, 0, sizeof(toaddr6));
+    toaddr6.sin6_family = AF_INET6;
+    toaddr6.sin6_port = htons(MDNS_PORT);
+    memcpy(&toaddr6.sin6_addr, mdns_ipv6_group, sizeof(mdns_ipv6_group));
+    toaddr6.sin6_scope_id = ifindex;
+    ssize_t sent =
+        sendto(s->sockfd6, data, len, 0, (struct sockaddr *)&toaddr6, sizeof(toaddr6));
     if (sent < 0)
       saved_errno = socket_set_errno();
     else
@@ -1355,6 +1416,57 @@ int mdnsd_add_ipv4_interface(struct mdnsd *s, uint32_t interface_addr) {
   s->ipv4_interfaces = interfaces;
   s->ipv4_interfaces[s->ipv4_interface_count++] = interface_addr;
   pthread_mutex_unlock(&s->send_lock);
+  return 0;
+}
+
+int mdnsd_add_ipv6_interface(struct mdnsd *s, unsigned int ifindex) {
+  pthread_mutex_lock(&s->send_lock);
+  for (size_t i = 0; i < s->ipv6_interface_count; i++) {
+    if (s->ipv6_interfaces[i] == ifindex) {
+      pthread_mutex_unlock(&s->send_lock);
+      return 0;
+    }
+  }
+
+  unsigned int *interfaces =
+      realloc(s->ipv6_interfaces, (s->ipv6_interface_count + 1) * sizeof(*interfaces));
+  if (interfaces == NULL) {
+    errno = ENOMEM;
+    pthread_mutex_unlock(&s->send_lock);
+    return -1;
+  }
+  s->ipv6_interfaces = interfaces;
+
+  int sockfd6 = s->sockfd6;
+  if (sockfd6 < 0) {
+    sockfd6 = create_recv_sock6();
+    if (sockfd6 < 0) {
+      pthread_mutex_unlock(&s->send_lock);
+      return -1;
+    }
+  }
+
+  struct ipv6_mreq mreq;
+  memset(&mreq, 0, sizeof(mreq));
+  memcpy(&mreq.ipv6mr_multiaddr, mdns_ipv6_group, sizeof(mdns_ipv6_group));
+  mreq.ipv6mr_interface = ifindex;
+  if (setsockopt(sockfd6, IPPROTO_IPV6, IPV6_JOIN_GROUP, (char *)&mreq, sizeof(mreq)) < 0) {
+    int saved_errno = socket_set_errno();
+    if (s->sockfd6 < 0)
+      safe_socket_close(&sockfd6);
+    errno = saved_errno;
+    pthread_mutex_unlock(&s->send_lock);
+    return -1;
+  }
+
+  int socket_created = s->sockfd6 < 0;
+  s->sockfd6 = sockfd6;
+  s->ipv6_interfaces[s->ipv6_interface_count++] = ifindex;
+  pthread_mutex_unlock(&s->send_lock);
+
+  // let the main loop start listening on the new socket
+  if (socket_created)
+    write_pipe(s->notify_pipe[1], ".", 1);
   return 0;
 }
 
@@ -1590,17 +1702,59 @@ int close_pipe(int *s) {
 #endif
 }
 
+// receive one packet from sockfd, process it and reply on the same address family
+static void receive_packet(struct mdnsd *svr, int sockfd, int reply_family, void *pkt_buffer,
+                           struct mdns_pkt *mdns_reply) {
+  struct sockaddr_storage fromaddr;
+  socklen_t sockaddr_size = sizeof(fromaddr);
+
+  ssize_t recvsize =
+      recvfrom(sockfd, pkt_buffer, PACKET_SIZE, 0, (struct sockaddr *)&fromaddr, &sockaddr_size);
+  if (recvsize < 0) {
+    log_message(LOG_ERR, "recv(): %s", strerror(socket_set_errno()));
+    // recvsize is passed to mdns_parse_pkt() as a size_t; a negative value
+    // would become huge and defeat every bounds check. Skip this datagram.
+    return;
+  }
+
+  char from_string[INET6_ADDRSTRLEN] = "";
+  if (fromaddr.ss_family == AF_INET6)
+    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&fromaddr)->sin6_addr, from_string,
+              sizeof(from_string));
+  else
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&fromaddr)->sin_addr, from_string,
+              sizeof(from_string));
+  DEBUG_PRINTF("data from=%s size=%ld\n", from_string, (long)recvsize);
+
+  struct mdns_pkt *mdns = mdns_parse_pkt(pkt_buffer, recvsize);
+  if (mdns != NULL) {
+    mdnsd_packet_callback packet_callback = NULL;
+    void *packet_callback_userdata = NULL;
+    pthread_mutex_lock(&svr->data_lock);
+    packet_callback = svr->packet_callback;
+    packet_callback_userdata = svr->packet_callback_userdata;
+    pthread_mutex_unlock(&svr->data_lock);
+    if (packet_callback)
+      packet_callback(mdns, packet_callback_userdata);
+
+    if (process_mdns_pkt(svr, mdns, mdns_reply)) {
+      size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
+      send_packet(svr, pkt_buffer, replylen, reply_family);
+    } else if (mdns->num_qn == 0) {
+      DEBUG_PRINTF("(no questions in packet)\n\n");
+    }
+
+    mdns_pkt_destroy(mdns);
+  }
+}
+
 // main loop to receive, process and send out MDNS replies
 // also handles MDNS service announces
 void *main_loop(struct mdnsd *svr) {
   fd_set sockfd_set;
-  int max_fd = svr->sockfd;
   char notify_buf[2]; // buffer for reading of notify_pipe
 
   void *pkt_buffer = malloc(PACKET_SIZE);
-
-  if (svr->notify_pipe[0] > max_fd)
-    max_fd = svr->notify_pipe[0];
 
   struct mdns_pkt *mdns_reply = malloc(sizeof(struct mdns_pkt));
   if (mdns_reply)
@@ -1609,49 +1763,30 @@ void *main_loop(struct mdnsd *svr) {
     die("could not allocate memory for \"mdns_reply\" in tinysvcmdns");
 
   while (!svr->stop_flag) {
+    // the IPv6 socket may be added while the loop is running
+    pthread_mutex_lock(&svr->send_lock);
+    int sockfd6 = svr->sockfd6;
+    pthread_mutex_unlock(&svr->send_lock);
+
+    int max_fd = svr->sockfd > svr->notify_pipe[0] ? svr->sockfd : svr->notify_pipe[0];
     FD_ZERO(&sockfd_set);
     FD_SET(svr->sockfd, &sockfd_set);
     FD_SET(svr->notify_pipe[0], &sockfd_set);
+    if (sockfd6 >= 0) {
+      FD_SET(sockfd6, &sockfd_set);
+      if (sockfd6 > max_fd)
+        max_fd = sockfd6;
+    }
     select(max_fd + 1, &sockfd_set, NULL, NULL, NULL);
 
     if (FD_ISSET(svr->notify_pipe[0], &sockfd_set)) {
       // flush the notify_pipe
       read_pipe(svr->notify_pipe[0], (char *)&notify_buf, 1);
-    } else if (FD_ISSET(svr->sockfd, &sockfd_set)) {
-      struct sockaddr_in fromaddr;
-      socklen_t sockaddr_size = sizeof(struct sockaddr_in);
-
-      ssize_t recvsize = recvfrom(svr->sockfd, pkt_buffer, PACKET_SIZE, 0,
-                                  (struct sockaddr *)&fromaddr, &sockaddr_size);
-      if (recvsize < 0) {
-        log_message(LOG_ERR, "recv(): %m");
-        // recvsize is passed to mdns_parse_pkt() as a size_t; a negative value
-        // would become huge and defeat every bounds check. Skip this datagram.
-        continue;
-      }
-
-      DEBUG_PRINTF("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), (long)recvsize);
-      struct mdns_pkt *mdns = mdns_parse_pkt(pkt_buffer, recvsize);
-      if (mdns != NULL) {
-        mdnsd_packet_callback packet_callback = NULL;
-        void *packet_callback_userdata = NULL;
-        pthread_mutex_lock(&svr->data_lock);
-        packet_callback = svr->packet_callback;
-        packet_callback_userdata = svr->packet_callback_userdata;
-        pthread_mutex_unlock(&svr->data_lock);
-        if (packet_callback)
-          packet_callback(mdns, packet_callback_userdata);
-
-        if (process_mdns_pkt(svr, mdns, mdns_reply)) {
-          size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
-          send_packet(svr, pkt_buffer, replylen);
-        } else if (mdns->num_qn == 0) {
-          DEBUG_PRINTF("(no questions in packet)\n\n");
-        }
-
-        mdns_pkt_destroy(mdns);
-      }
     }
+    if (FD_ISSET(svr->sockfd, &sockfd_set))
+      receive_packet(svr, svr->sockfd, MDNS_SEND_IPV4, pkt_buffer, mdns_reply);
+    if ((sockfd6 >= 0) && FD_ISSET(sockfd6, &sockfd_set))
+      receive_packet(svr, sockfd6, MDNS_SEND_IPV6, pkt_buffer, mdns_reply);
 
     // send out announces
     while (1) {
@@ -1674,7 +1809,7 @@ void *main_loop(struct mdnsd *svr) {
 
       if (mdns_reply->num_ans_rr > 0) {
         size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
-        send_packet(svr, pkt_buffer, replylen);
+        send_packet(svr, pkt_buffer, replylen, MDNS_SEND_ALL);
       }
     }
   }
@@ -1694,7 +1829,7 @@ void *main_loop(struct mdnsd *svr) {
   // send out packet
   if (mdns_reply->num_ans_rr > 0) {
     size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
-    send_packet(svr, pkt_buffer, replylen);
+    send_packet(svr, pkt_buffer, replylen, MDNS_SEND_ALL);
   }
 
   // destroy packet
@@ -1704,6 +1839,10 @@ void *main_loop(struct mdnsd *svr) {
   free(pkt_buffer);
 
   close_pipe(&svr->sockfd);
+  pthread_mutex_lock(&svr->send_lock);
+  if (svr->sockfd6 >= 0)
+    safe_socket_close(&svr->sockfd6);
+  pthread_mutex_unlock(&svr->send_lock);
 
   svr->stop_flag = 2;
   return NULL;
@@ -1790,7 +1929,7 @@ int mdnsd_send_query(struct mdnsd *svr, const char *name, uint16_t type) {
   p = mdns_write_u16(p, 1); // class IN
 
   free(nlabel);
-  return send_packet(svr, packet, p - packet) < 0 ? -1 : 0;
+  return send_packet(svr, packet, p - packet, MDNS_SEND_ALL) < 0 ? -1 : 0;
 }
 
 struct mdns_service *mdnsd_register_svc(struct mdnsd *svr, const char *instance_name,
@@ -1875,6 +2014,7 @@ struct mdnsd *mdnsd_start() {
     memset(server, 0, sizeof(struct mdnsd));
   else
     die("could not allocate memory for \"server\" in tinysvcmdns");
+  server->sockfd6 = -1;
 
   if (create_pipe(server->notify_pipe) != 0) {
     log_message(LOG_ERR, "pipe(): %m\n");
@@ -1922,6 +2062,7 @@ void mdnsd_stop(struct mdnsd *s) {
   if (s->hostname)
     free(s->hostname);
   free(s->ipv4_interfaces);
+  free(s->ipv6_interfaces);
 
   free(s);
 }

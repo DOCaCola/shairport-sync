@@ -41,20 +41,92 @@ int socket_set_errno(void) {
   case WSAEINTR:
     errno = EINTR;
     break;
+  case WSAEBADF:
+    errno = EBADF;
+    break;
+  case WSAEACCES:
+    errno = EACCES;
+    break;
+  case WSAEFAULT:
+    errno = EFAULT;
+    break;
+  case WSAEINVAL:
+    errno = EINVAL;
+    break;
+  case WSAEMFILE:
+    errno = EMFILE;
+    break;
   case WSAEWOULDBLOCK:
     errno = EAGAIN;
+    break;
+  case WSAEINPROGRESS:
+    errno = EINPROGRESS;
+    break;
+  case WSAEALREADY:
+    errno = EALREADY;
+    break;
+  case WSAENOTSOCK:
+    errno = ENOTSOCK;
+    break;
+  case WSAEDESTADDRREQ:
+    errno = EDESTADDRREQ;
+    break;
+  case WSAEMSGSIZE:
+    errno = EMSGSIZE;
+    break;
+  case WSAEPROTOTYPE:
+    errno = EPROTOTYPE;
+    break;
+  case WSAENOPROTOOPT:
+    errno = ENOPROTOOPT;
+    break;
+  case WSAEPROTONOSUPPORT:
+    errno = EPROTONOSUPPORT;
+    break;
+  case WSAEOPNOTSUPP:
+    errno = EOPNOTSUPP;
+    break;
+  case WSAEAFNOSUPPORT:
+    errno = EAFNOSUPPORT;
     break;
   case WSAEADDRINUSE:
     errno = EADDRINUSE;
     break;
+  case WSAEADDRNOTAVAIL:
+    errno = EADDRNOTAVAIL;
+    break;
+  case WSAENETDOWN:
+    errno = ENETDOWN;
+    break;
+  case WSAENETUNREACH:
+    errno = ENETUNREACH;
+    break;
+  case WSAENETRESET:
+    errno = ENETRESET;
+    break;
+  case WSAECONNABORTED:
+    errno = ECONNABORTED;
+    break;
   case WSAECONNRESET:
     errno = ECONNRESET;
+    break;
+  case WSAENOBUFS:
+    errno = ENOBUFS;
+    break;
+  case WSAEISCONN:
+    errno = EISCONN;
+    break;
+  case WSAENOTCONN:
+    errno = ENOTCONN;
     break;
   case WSAETIMEDOUT:
     errno = ETIMEDOUT;
     break;
   case WSAECONNREFUSED:
     errno = ECONNREFUSED;
+    break;
+  case WSAEHOSTUNREACH:
+    errno = EHOSTUNREACH;
     break;
   default:
     errno = EIO;

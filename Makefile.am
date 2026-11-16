@@ -35,7 +35,7 @@ shairport_sync_SOURCES = shairport.c bonjour_strings.c mdns.c common.c rtp.c \
   utilities/exit.c
 
 if BUILD_FOR_MINGW
-shairport_sync_SOURCES += utilities/mingw_ifaddrs.c
+shairport_sync_SOURCES += utilities/mingw_ifaddrs.c utilities/mingw_compat.c
 endif
 
 if BUILD_FOR_DARWIN

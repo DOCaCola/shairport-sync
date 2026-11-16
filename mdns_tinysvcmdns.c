@@ -255,6 +255,13 @@ static int mdns_tinysvcmdns_register(char *ap1name, char *ap2name, int port, cha
       struct rr_entry *aaaa_e =
           rr_create_aaaa(create_nlabel(hostname), addr); // TTL should be 120 seconds
       mdnsd_add_rr(server->server, aaaa_e);
+
+      if (mdnsd_add_ipv6_interface(server->server, if_nametoindex(ifa->ifa_name)) != 0) {
+        char errorstring[1024];
+        getErrorText(errorstring, sizeof(errorstring));
+        warn("tinysvcmdns: could not join the IPv6 mDNS group on interface \"%s\": %s",
+             ifa->ifa_name, errorstring);
+      }
     }
   }
 

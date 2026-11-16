@@ -16,9 +16,19 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+// Included before the sleep macros below so that their declarations are not rewritten.
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 unsigned long if_nametoindex(const char *ifname);
 int shairport_mingw_get_device_id(uint8_t *id, int int_length);
+int shairport_mingw_strerror_r(int errnum, char *buf, size_t buflen);
+char *shairport_mingw_strerror(int errnum);
+// POSIX sleeps: cancellation points when cancellation is enabled, full-length otherwise.
+int shairport_mingw_nanosleep(const struct timespec *request, struct timespec *remaining);
+int shairport_mingw_usleep(useconds_t usec);
+unsigned int shairport_mingw_sleep(unsigned int seconds);
 
 #ifndef O_NONBLOCK
 #define O_NONBLOCK 0
@@ -59,10 +69,6 @@ static inline int shairport_mingw_dprintf(int fd, const char *format, ...) {
   return _write(fd, buffer, (unsigned int)count);
 }
 
-static inline int shairport_mingw_strerror_r(int errnum, char *buf, size_t buflen) {
-  return strerror_s(buf, buflen, errnum);
-}
-
 static inline int shairport_mingw_fcntl(int fd, int cmd, ...) {
   (void)fd;
   if (cmd == F_GETFL)
@@ -99,6 +105,11 @@ static inline char *strsep(char **stringp, const char *delim) {
 #define pipe(handles) shairport_mingw_pipe((handles))
 #define dprintf(fd, format, ...) shairport_mingw_dprintf((fd), (format), __VA_ARGS__)
 #define strerror_r(errnum, buf, buflen) shairport_mingw_strerror_r((errnum), (buf), (buflen))
+#define strerror(errnum) shairport_mingw_strerror((errnum))
+#undef nanosleep
+#define nanosleep(request, remaining) shairport_mingw_nanosleep((request), (remaining))
+#define usleep(usec) shairport_mingw_usleep((usec))
+#define sleep(seconds) shairport_mingw_sleep((seconds))
 #define mkdir(path, mode) _mkdir((path))
 #define fcntl(fd, cmd, ...) shairport_mingw_fcntl((fd), (cmd), ##__VA_ARGS__)
 #define drand48() ((double)rand() / ((double)RAND_MAX + 1.0))

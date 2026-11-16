@@ -309,6 +309,7 @@ void *rtp_audio_receiver(void *arg) {
       }
       warn("Audio receiver -- Unknown RTP packet of type 0x%02X length %zd.", type, nread);
     } else {
+      socket_set_errno();
       char em[1024];
       strerror_r(errno, em, sizeof(em));
       debug(1, "Error %d receiving an audio packet: \"%s\".", errno, em);
@@ -581,7 +582,7 @@ void *rtp_control_receiver(void *arg) {
         debug(3, "Control Receiver -- dropping a packet to simulate a bad network.");
       }
     } else {
-
+      socket_set_errno();
       char em[1024];
       strerror_r(errno, em, sizeof(em));
       debug(1, "Control Receiver -- error %d receiving a packet: \"%s\".", errno, em);
@@ -649,22 +650,17 @@ void *rtp_timing_sender(void *arg) {
         (drand48() > config.diagnostic_drop_packet_fraction)) {
       if (sendto(conn->timing_socket, &req, sizeof(req), 0,
                  (struct sockaddr *)&conn->rtp_client_timing_socket, msgsize) == -1) {
+        socket_set_errno();
         char em[1024];
         strerror_r(errno, em, sizeof(em));
         debug(1, "Error %d using send-to to the timing socket: \"%s\".", errno, em);
       }
-#ifdef CONFIG_FOR_MINGW
-      pthread_testcancel();
-#endif
     } else {
       debug(3, "Timing Sender Thread -- dropping outgoing packet to simulate bad network.");
     }
 
     request_number++;
 
-#ifdef CONFIG_FOR_MINGW
-    pthread_testcancel();
-#endif
     if (request_number <= 3)
       usleep(300000); // these are thread cancellation points
     else
@@ -1767,6 +1763,7 @@ void *rtp_ap2_control_receiver(void *arg) {
       }
     } else {
       if (nread == -1) {
+        socket_set_errno();
         if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
           if (conn->airplay_stream_type == realtime_stream) {
             debug(1,

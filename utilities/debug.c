@@ -163,12 +163,13 @@ static void async_output_output_init(void) {
 }
 
 static void async_output_enqueue(FILE *stream, const char *message) {
-  if (async_output_writer_available == 0 ||
-      TryAcquireSRWLockExclusive(&async_output_queue_lock) == 0) {
+  if (async_output_writer_available == 0) {
     InterlockedIncrement(&async_output_messages_dropped);
     return;
   }
 
+  // The lock only guards copying into the queue; console I/O happens outside it.
+  AcquireSRWLockExclusive(&async_output_queue_lock);
   if (async_output_queue_count == ASYNC_OUTPUT_QUEUE_CAPACITY) {
     ReleaseSRWLockExclusive(&async_output_queue_lock);
     InterlockedIncrement(&async_output_messages_dropped);
